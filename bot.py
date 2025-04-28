@@ -152,42 +152,71 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         formats = video_info.get('formats', [])
 
         if formats:
-            # --- Изменено: Логика создания кнопок качества ---
+            # --- Изменено: Возвращаем детальные кнопки, но callback_data указывает категорию --- 
             video_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('height', 0) > 0]
-            max_height = 0
-            if video_formats:
-                max_height = max(f.get('height', 0) for f in video_formats)
-
-            keyboard = []
-            offered_qualities = set()
-
-            # Предлагаем качества на основе доступной высоты
-            if video_formats: # Предлагаем низкое, если есть хоть какое-то видео
-                 quality_key = 'low'
-                 keyboard.append([InlineKeyboardButton(
-                     get_message('quality_low'), # Используем локализованное название
-                     callback_data=f"format_{quality_key}"
-                 )])
-                 offered_qualities.add(quality_key)
-
-            if max_height >= 480:
-                quality_key = 'medium'
-                keyboard.append([InlineKeyboardButton(
-                    get_message('quality_medium'),
-                    callback_data=f"format_{quality_key}"
-                )])
-                offered_qualities.add(quality_key)
             
-            # Порог для высокого качества - 720p
-            if max_height >= 720:
-                quality_key = 'high'
-                keyboard.append([InlineKeyboardButton(
-                    get_message('quality_high'),
-                    callback_data=f"format_{quality_key}"
-                )])
-                offered_qualities.add(quality_key)
+            if not video_formats:
+                 logger.info(f"Видеоформаты не найдены для {url}, предлагаем только аудио/авто.")
+                 keyboard = [
+                     [InlineKeyboardButton(get_message('quality_audio'), callback_data="format_audio")],
+                     [InlineKeyboardButton(get_message('quality_auto_button'), callback_data="format_auto")]
+                 ]
+            else:
+                video_formats.sort(key=lambda x: int(x.get('height', 0) or 0), reverse=True)
+                grouped_formats = {}
+                # Группируем по высоте, чтобы предложить по одной кнопке на разрешение
+                for f in video_formats:
+                    height = f.get('height')
+                    if height and height not in grouped_formats:
+                         grouped_formats[height] = f # Берем первый попавшийся формат для этой высоты
+                
+                keyboard = []
+                format_list_texts = [] # Тексты для отображения в сообщении
+                
+                # Создаем кнопки для каждого уникального разрешения
+                for height, f in sorted(grouped_formats.items(), reverse=True):
+                    format_id = f.get('format_id') # Получаем ID для информации, но не для callback
+                    if not format_id:
+                        logger.warning(f"Пропуск формата без ID для URL {url}: {f}")
+                        continue
+
+                    # Определяем категорию качества для callback_data
+                    quality_category = 'high' # По умолчанию
+                    if height <= 480:
+                        quality_category = 'medium'
+                    # Условие для low может быть сложнее, т.к. зависит от худшего. 
+                    # Пока оставим так: все <= 480 это medium, все > 480 это high.
+                    # Можно добавить более точное определение, если нужно.
+                    
+                    # Рассчитываем размер для отображения
+                    size_mb = "?"
+                    if f.get('filesize'):
+                        size_mb = f"{round(f['filesize'] / (1024 * 1024), 1)} MB"
+                    elif f.get('tbr'):
+                        duration = video_info.get('duration', 0)
+                        if duration and duration > 0:
+                            try:
+                                 estimated_size = f['tbr'] * 1000 * duration / 8 / (1024 * 1024)
+                                 size_mb = f"~{round(estimated_size, 1)} MB"
+                            except TypeError:
+                                logger.warning(f"Ошибка при расчете размера для формата {format_id}")
+                    
+                    # Текст кнопки и описание формата
+                    format_button_text = get_message('quality_format',
+                        resolution=f"{height}p",
+                        size=size_mb,
+                        fps=f.get('fps', '?')
+                    )
+                    format_list_texts.append(f"- {format_button_text}") # Добавляем в список для сообщения
+
+                    # Создаем кнопку: текст детальный, callback - категория
+                    button_callback_data = f"format_{quality_category}"
+                    keyboard.append([InlineKeyboardButton(
+                        format_button_text,
+                        callback_data=button_callback_data
+                    )])
             
-            # Всегда предлагаем аудио и авто
+            # Добавляем кнопки Аудио и Авто
             keyboard.append([InlineKeyboardButton(
                 get_message('quality_audio'), 
                 callback_data="format_audio"
@@ -207,7 +236,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.debug(f"Сохранен URL '{url}' для message_id {message_id} в chat_data.")
 
             await progress_message.edit_text(
-                get_message('quality_selection_new'), # Используем новый ключ локализации
+                get_message('quality_selection', formats="\n".join(format_list_texts)), # Возвращаем старый ключ
                 reply_markup=reply_markup
             )
         else:
@@ -319,211 +348,235 @@ async def send_notification(context: ContextTypes.DEFAULT_TYPE, user_id: int, no
     except Exception as e:
         logger.error(f"Ошибка при отправке уведомления '{notification_type}' пользователю {user_id}: {e}")
 
-async def download_with_quality(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, format_id: str, progress_message):
-    """Скачивание видео с выбранным качеством"""
-    user_id = update.effective_user.id
-    chat_id = progress_message.chat_id
-    message_id = progress_message.message_id
-    result = None
-    video_parts = []
-    progress_task = None # Инициализируем здесь
-    # --- Добавлено: Переменные для очистки в finally --- 
-    url_for_cleanup = url
-    canonical_url_for_cleanup = None
-    # --- Конец добавления ---
+# --- Рефакторинг: Вспомогательные функции для download_with_quality --- 
+
+async def _initialize_download(context: ContextTypes.DEFAULT_TYPE, url: str, format_id: str, user_id: int, chat_id: int, message_id: int):
+    """Инициализирует загрузку: получает инфо, определяет качество, обновляет сообщение, инициализирует словари."""
+    start_time = time.time()
+    actual_format_id = format_id
+    quality_name = format_id
+    canonical_url = url # Значение по умолчанию
 
     try:
-        start_time = time.time()
-        actual_format_id = format_id # По умолчанию используем переданный ID
-        quality_name = format_id # Значение по умолчанию для quality_name
+        video_info = await downloader.get_video_info(url)
+        canonical_url = video_info.get('webpage_url', url)
+    except Exception as info_err:
+        logger.warning(f"Не удалось получить video_info для '{url}' в _initialize_download: {info_err}. Используем исходный URL как канонический.")
 
-        # --- Добавлено: Получаем канонический URL --- 
-        try:
-            video_info = await downloader.get_video_info(url)
-            canonical_url_for_cleanup = video_info.get('webpage_url', url)
-        except Exception as info_err:
-             logger.warning(f"Не удалось получить video_info для '{url}' в download_with_quality: {info_err}. Используем исходный URL как канонический.")
-             canonical_url_for_cleanup = url
-        # --- Конец добавления ---
+    # Определение quality_name (логика из старой функции)
+    if format_id == "auto":
+        quality_label = await downloader.get_optimal_quality(url, user_id)
+        quality_name = {
+            "low": get_message('quality_low'),
+            "medium": get_message('quality_medium'),
+            "high": get_message('quality_high'),
+        }.get(quality_label, quality_label)
+        actual_format_id = quality_label
+    elif format_id in ["low", "medium", "high", "audio"]:
+        quality_name = {
+            "low": get_message('quality_low'),
+            "medium": get_message('quality_medium'),
+            "high": get_message('quality_high'),
+            "audio": get_message('quality_audio')
+        }.get(format_id, format_id)
+    elif format_id.isdigit():
+        quality_name = get_message('quality_numeric_format', format_id=format_id)
+    else:
+        logger.warning(f"Неизвестный format_id '{format_id}' получен в _initialize_download")
 
-        if format_id == "auto":
-            quality_label = await downloader.get_optimal_quality(url, user_id)
-            # Используем читаемые имена из локализации, если они есть
-            quality_name = {
-                "low": get_message('quality_low'),
-                "medium": get_message('quality_medium'),
-                "high": get_message('quality_high'),
-            }.get(quality_label, quality_label) # Фоллбэк на сам label
-            actual_format_id = quality_label # Обновляем ID для скачивания
-        elif format_id in ["low", "medium", "high", "audio"]:
-             # Используем читаемые имена из локализации
-            quality_name = {
-                "low": get_message('quality_low'),
-                "medium": get_message('quality_medium'),
-                "high": get_message('quality_high'),
-                "audio": get_message('quality_audio')
-            }.get(format_id, format_id) # Фоллбэк на сам format_id
-        elif format_id.isdigit():
-             # Если это числовой ID, показываем его понятнее
-             quality_name = get_message('quality_numeric_format', format_id=format_id)
-             # actual_format_id уже содержит числовой ID
-        else:
-            # Для неизвестных форматов (на всякий случай)
-            logger.warning(f"Неизвестный format_id '{format_id}' получен в download_with_quality")
-            quality_name = format_id # Оставляем как есть
-
-        # --- Обновление сообщения (оставляем как есть) --- 
-        text_to_set = get_message('quality_selected', quality=quality_name)
-        try:
-            await progress_message.edit_text(text=text_to_set, reply_markup=None)
-            logger.debug(f"Обновлено сообщение {message_id} с качеством ('{quality_name}') без кнопки отмены.")
-        except Exception as edit_err:
-             logger.error(f"Не удалось обновить сообщение {message_id} с выбранным качеством: {edit_err}")
-        # --- Конец обновления сообщения --- 
-
-        # --- Добавлено: Инициализация active_downloads и map --- 
-        with data_lock: # Используем лок напрямую
-            active_downloads[url_for_cleanup] = {
-                'percent': 0, 'percent_rounded': 0, 'downloaded_bytes': 0,
-                'speed': 0, 'eta': 0, 'filename': None,
-                'chat_id': chat_id, 'message_id': message_id,
-                'canonical_url': canonical_url_for_cleanup,
-                'process': None
-            }
-            canonical_url_map[canonical_url_for_cleanup] = url_for_cleanup
-            logger.debug(f"Initialized active_downloads and map for {url_for_cleanup} (canonical: {canonical_url_for_cleanup})")
-        # --- Конец инициализации --- 
-
-        # --- Запускаем задачу обновления прогресса ПОСЛЕ инициализации --- 
-        progress_task = context.application.create_task(
-            update_progress_message(context, chat_id, message_id, url_for_cleanup)
+    # Обновление сообщения
+    text_to_set = get_message('quality_selected', quality=quality_name)
+    try:
+        progress_message = await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text_to_set,
+            reply_markup=None
         )
-        # --- Конец запуска задачи --- 
+        logger.debug(f"Обновлено сообщение {message_id} с качеством ('{quality_name}').")
+    except Exception as edit_err:
+        logger.error(f"Не удалось обновить сообщение {message_id} с выбранным качеством в _initialize_download: {edit_err}")
+        raise # Перебрасываем ошибку, т.к. без сообщения неясно, что происходит
 
-        # Скачиваем видео
-        result = await downloader.download_video(url_for_cleanup, actual_format_id, user_id, chat_id, message_id)
-
-    except Exception as e:
-        # Обработка ВСЕХ ошибок до отправки уведомления пользователю
-        logger.exception(f"Ошибка на этапе выбора/скачивания для URL '{url_for_cleanup}': {e}")
-        if progress_task and not progress_task.done():
-            progress_task.cancel()
-        try:
-            await progress_message.edit_text(get_message('download_error'))
-        except Exception as edit_err:
-            logger.error(f"Не удалось отредактировать сообщение об ошибке скачивания: {edit_err}")
-        await send_notification(
-            context, user_id, "download_error",
-            title=result.get('title', url_for_cleanup) if result else url_for_cleanup,
-            error=str(e)
-        )
-        return # Прерываем выполнение функции после ошибки скачивания
-    finally:
-        # Останавливаем задачу обновления прогресса (если она была запущена и не завершена)
-        if progress_task and not progress_task.done():
-            progress_task.cancel()
-            logger.debug(f"Задача обновления прогресса для URL '{url_for_cleanup}' отменена в finally download_with_quality.")
+    # Инициализация active_downloads и map
+    with data_lock:
+        active_downloads[url] = {
+            'percent': 0, 'percent_rounded': 0, 'downloaded_bytes': 0,
+            'speed': 0, 'eta': 0, 'filename': None,
+            'chat_id': chat_id, 'message_id': message_id,
+            'canonical_url': canonical_url,
+            'process': None
+        }
+        canonical_url_map[canonical_url] = url
+        logger.debug(f"Initialized active_downloads and map for {url} (canonical: {canonical_url})")
         
-        # --- Добавлено: Гарантированная очистка словарей в случае ошибки ЗДЕСЬ --- 
-        with data_lock: # Используем лок напрямую
-            if url_for_cleanup in active_downloads:
-                logger.debug(f"Выполняется очистка active_downloads для {url_for_cleanup} в finally download_with_quality.")
-                del active_downloads[url_for_cleanup]
-            if canonical_url_for_cleanup and canonical_url_for_cleanup in canonical_url_map:
-                logger.debug(f"Выполняется очистка canonical_url_map для {canonical_url_for_cleanup} в finally download_with_quality.")
-                del canonical_url_map[canonical_url_for_cleanup]
-        # --- Конец добавления --- 
+    return actual_format_id, canonical_url, start_time, progress_message
 
-    # --- Если скачивание прошло успешно --- 
-    if result: # Добавляем проверку, что result не None
-        try:
-            download_duration = round(time.time() - start_time, 1)
-            # Отправляем уведомление о завершении скачивания
-            await send_notification(
-                context, user_id, "download_complete",
-                title=result['title'],
-                quality=config.DEFAULT_QUALITY.get(actual_format_id, actual_format_id),
-                size=round(result['size'] / (1024 * 1024), 1),
-                time=download_duration
-            )
+async def _run_actual_download(context: ContextTypes.DEFAULT_TYPE, url: str, actual_format_id: str, user_id: int, chat_id: int, message_id: int):
+    """Запускает фоновую задачу обновления прогресса и саму загрузку."""
+    progress_task = context.application.create_task(
+        update_progress_message(context, chat_id, message_id, url)
+    )
+    
+    try:
+        result = await downloader.download_video(url, actual_format_id, user_id, chat_id, message_id)
+        return result, progress_task
+    except Exception:
+         # Если скачивание не удалось, отменяем задачу прогресса здесь
+         if progress_task and not progress_task.done():
+              progress_task.cancel()
+         raise # Перебрасываем ошибку дальше
 
-            # Отправляем видео пользователю
-            file_path = result['file_path']
-            file_size = result['size']
+async def _send_video_result(context: ContextTypes.DEFAULT_TYPE, result: dict, chat_id: int, message_id: int, progress_message):
+    """Обрабатывает результат скачивания, отправляет видео (возможно, по частям)."""
+    video_parts = []
+    file_path = result['file_path']
+    file_size = result['size']
+    title = result['title']
 
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"Файл не найден после скачивания: {file_path}")
-            if file_size == 0:
-                raise ValueError(f"Файл после скачивания пустой: {file_path}")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Файл не найден после скачивания: {file_path}")
+    if file_size == 0:
+        raise ValueError(f"Файл после скачивания пустой: {file_path}")
 
-            if file_size > config.MAX_TELEGRAM_SIZE:
-                await progress_message.edit_text(get_message('split_video_started'))
-                video_parts = downloader.split_large_video(file_path)
-                if not video_parts:
-                     raise ValueError(f"Не удалось разделить видео: {file_path}")
+    try:
+        if file_size > config.MAX_TELEGRAM_SIZE:
+            await progress_message.edit_text(get_message('split_video_started'))
+            # Разделение теперь синхронное, но вызывается из async контекста
+            # Для полной асинхронности нужно переделывать split_large_video
+            video_parts = downloader.split_large_video(file_path)
+            if not video_parts:
+                raise ValueError(f"Не удалось разделить видео: {file_path}")
 
-                total_parts = len(video_parts)
-                for i, part_path in enumerate(video_parts, 1):
-                    logger.info(f"Отправка части {i}/{total_parts}: {part_path}")
-                    with open(part_path, 'rb') as part_file:
-                        await context.bot.send_video(
-                            chat_id=chat_id,
-                            video=part_file,
-                            caption=get_message('split_video_part', part=i, total=total_parts, title=result['title']),
-                            supports_streaming=True,
-                            read_timeout=120, write_timeout=120, connect_timeout=60, pool_timeout=120 # Еще увеличенные таймауты
-                        )
-                await progress_message.edit_text(get_message('split_video_completed'))
-            else:
-                logger.info(f"Отправка целого файла: {file_path}")
-                with open(file_path, 'rb') as video_file:
+            total_parts = len(video_parts)
+            for i, part_path in enumerate(video_parts, 1):
+                logger.info(f"Отправка части {i}/{total_parts}: {part_path}")
+                with open(part_path, 'rb') as part_file:
                     await context.bot.send_video(
                         chat_id=chat_id,
-                        video=video_file,
-                        caption=f"🎥 {result['title']}",
+                        video=part_file,
+                        caption=get_message('split_video_part', part=i, total=total_parts, title=title),
                         supports_streaming=True,
                         read_timeout=120, write_timeout=120, connect_timeout=60, pool_timeout=120
                     )
-                await progress_message.delete()
-
-        except Exception as e:
-            # Ошибки отправки или разделения
-            logger.exception(f"Ошибка при отправке/разделении видео для URL '{url_for_cleanup}': {e}")
+            await progress_message.edit_text(get_message('split_video_completed'))
+        else:
+            logger.info(f"Отправка целого файла: {file_path}")
+            with open(file_path, 'rb') as video_file:
+                await context.bot.send_video(
+                    chat_id=chat_id,
+                    video=video_file,
+                    caption=f"🎥 {title}",
+                    supports_streaming=True,
+                    read_timeout=120, write_timeout=120, connect_timeout=60, pool_timeout=120
+                )
+            # Удаляем сообщение о прогрессе после успешной отправки целого файла
             try:
-                await progress_message.edit_text(get_message('download_error')) # Показываем общую ошибку
-            except Exception as edit_err:
-                logger.error(f"Не удалось отредактировать сообщение об ошибке отправки/разделения: {edit_err}")
+                 await progress_message.delete()
+            except Exception as del_err:
+                 logger.warning(f"Не удалось удалить сообщение о прогрессе {message_id}: {del_err}")
+
+    finally:
+        # Гарантированное удаление частей видео, если они были созданы
+        for part_f in video_parts:
+            try:
+                if os.path.exists(part_f):
+                    os.remove(part_f)
+                    logger.info(f"Удалена часть видео: {part_f}")
+            except OSError as rm_err:
+                 logger.warning(f"Не удалось удалить часть видео {part_f}: {rm_err}")
+        
+        # Удаляем исходный файл, если кэш отключен и видео НЕ разделялось
+        # (Если разделялось, части удалены выше, а исходный может быть нужен кэшу)
+        if not video_parts and not config.CACHE_ENABLED:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    logger.info(f"Удален исходный файл (кэш отключен): {file_path}")
+            except OSError as rm_err:
+                logger.warning(f"Не удалось удалить исходный файл {file_path}: {rm_err}")
+
+def _cleanup_download_state(url: str, canonical_url: str | None, progress_task):
+    """Отменяет задачу прогресса и очищает словари."""
+    if progress_task and not progress_task.done():
+        progress_task.cancel()
+        logger.debug(f"Задача обновления прогресса для URL '{url}' отменена в _cleanup_download_state.")
+    
+    with data_lock:
+        if url in active_downloads:
+            logger.debug(f"Очистка active_downloads для {url} в _cleanup_download_state.")
+            del active_downloads[url]
+        if canonical_url and canonical_url in canonical_url_map:
+            logger.debug(f"Очистка canonical_url_map для {canonical_url} в _cleanup_download_state.")
+            del canonical_url_map[canonical_url]
+
+# --- Конец вспомогательных функций --- 
+
+async def download_with_quality(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, format_id: str, progress_message):
+    """Скачивание видео с выбранным качеством (оркестратор)"""
+    user_id = update.effective_user.id
+    chat_id = progress_message.chat_id
+    message_id = progress_message.message_id # Получаем ID из переданного сообщения
+    
+    result = None
+    progress_task = None
+    canonical_url = None
+    start_time = None
+
+    try:
+        # 1. Инициализация
+        actual_format_id, canonical_url, start_time, current_progress_message = await _initialize_download(
+            context, url, format_id, user_id, chat_id, message_id
+        )
+        # Обновляем progress_message на случай, если edit_message_text вернул новый объект
+        progress_message = current_progress_message 
+
+        # 2. Запуск скачивания и прогресса
+        result, progress_task = await _run_actual_download(
+            context, url, actual_format_id, user_id, chat_id, message_id
+        )
+
+        # 3. Обработка и отправка результата (если скачивание успешно)
+        if result:
+            # Отправляем уведомление о завершении
+            download_duration = round(time.time() - start_time, 1)
             await send_notification(
-                context, user_id, "download_error",
-                title=result.get('title', url_for_cleanup) if result else url_for_cleanup,
-                error=str(e)
+                context, user_id, "download_complete",
+                title=result['title'],
+                # Используем actual_format_id для получения имени качества
+                quality=get_message(f'quality_{actual_format_id}') if actual_format_id in ['low', 'medium', 'high', 'audio'] else actual_format_id,
+                size=round(result['size'] / (1024 * 1024), 1),
+                time=download_duration
             )
+            # Отправляем видео
+            await _send_video_result(context, result, chat_id, message_id, progress_message)
 
-        finally:
-            # Гарантированная очистка временных файлов и контекста чата
-            if CHAT_CONTEXT_KEY in context.chat_data and message_id in context.chat_data[CHAT_CONTEXT_KEY]:
-                del context.chat_data[CHAT_CONTEXT_KEY][message_id]
-                logger.debug(f"Очищен контекст для message_id {message_id}")
+    except Exception as e:
+        logger.exception(f"Ошибка при обработке запроса на скачивание для URL '{url}': {e}")
+        try:
+            # Пытаемся обновить исходное сообщение об ошибке
+            await context.bot.edit_message_text(
+                chat_id=chat_id, 
+                message_id=message_id, 
+                text=get_message('download_error')
+            )
+        except Exception as edit_err:
+            logger.error(f"Не удалось отредактировать сообщение {message_id} об ошибке скачивания: {edit_err}")
+        # Отправляем уведомление об ошибке
+        await send_notification(
+            context, user_id, "download_error",
+            title=url, # Используем URL, т.к. title может быть недоступен
+            error=str(e)
+        )
 
-            # Удаляем скачанный файл, если кэш отключен
-            if result and 'file_path' in result and not config.CACHE_ENABLED:
-                 file_to_remove = result['file_path']
-                 if not video_parts: # Не удаляем, если он был разделен (части удаляются ниже)
-                     try:
-                         if os.path.exists(file_to_remove):
-                             os.remove(file_to_remove)
-                             logger.info(f"Удален исходный файл (кэш отключен): {file_to_remove}")
-                     except OSError as rm_err:
-                         logger.warning(f"Не удалось удалить исходный файл {file_to_remove}: {rm_err}")
-
-            # Удаляем части видео
-            for part_f in video_parts:
-                try:
-                    if os.path.exists(part_f):
-                        os.remove(part_f)
-                        logger.info(f"Удалена часть видео: {part_f}")
-                except OSError as rm_err:
-                     logger.warning(f"Не удалось удалить часть видео {part_f}: {rm_err}")
+    finally:
+        # 4. Очистка состояния (прогресс-задача, словари)
+        _cleanup_download_state(url, canonical_url, progress_task)
+        
+        # Очистка контекста чата (для callback-кнопок, если они были)
+        if CHAT_CONTEXT_KEY in context.chat_data and message_id in context.chat_data[CHAT_CONTEXT_KEY]:
+            del context.chat_data[CHAT_CONTEXT_KEY][message_id]
+            logger.debug(f"Очищен контекст чата для message_id {message_id}")
 
 async def format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик выбора формата видео"""
