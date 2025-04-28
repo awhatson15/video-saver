@@ -11,6 +11,8 @@ import math
 import json
 import threading
 import time
+import aiofiles
+import aiofiles.os
 
 # Настройка логирования
 logging.basicConfig(
@@ -169,6 +171,10 @@ class VideoDownloader:
         info = None # Инициализируем info
         loop = asyncio.get_event_loop()
         try:
+            # --- Добавлено: Асинхронное создание директории --- 
+            await aiofiles.os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)
+            # --- Конец добавления ---
+            
             # Определяем параметры для _download
             output_template = os.path.join(config.DOWNLOAD_DIR, '%(title)s.%(ext)s')
             
@@ -265,13 +271,14 @@ class VideoDownloader:
             # Запускаем загрузку (остается run_in_executor)
             info, filename = await loop.run_in_executor(executor, _download)
             
-            # Проверяем, существует ли файл после скачивания
-            if not filename or not os.path.exists(filename):
-                # Если info есть, используем его для сообщения об ошибке
+            # --- Изменено: Асинхронная проверка файла --- 
+            if not filename or not await aiofiles.os.path.exists(filename):
                 err_title = info.get('title', url) if info else url
                 raise FileNotFoundError(f"Downloaded file not found after thread execution for {err_title}: {filename}")
 
-            file_size = os.path.getsize(filename)
+            stat_result = await aiofiles.os.stat(filename)
+            file_size = stat_result.st_size
+            # --- Конец изменений ---
             
             # Добавляем видео в кэш (если включено и успешно скачано)
             if config.CACHE_ENABLED:
@@ -314,14 +321,15 @@ class VideoDownloader:
                         logger.debug(f"Removed mapping for {canonical_url_to_remove}. Current map: {canonical_url_map}")
             # --- Конец изменений --- 
             
-            # Удаляем файл вне блокировки
+            # --- Изменено: Асинхронное удаление файла --- 
             if final_filename and not config.CACHE_ENABLED:
-                try:
-                    if os.path.exists(final_filename):
-                        os.remove(final_filename)
-                        logger.info(f"Удален временный файл: {final_filename}")
-                except OSError as rm_err:
-                    logger.error(f"Не удалось удалить временный файл {final_filename}: {rm_err}")
+                 try:
+                     if await aiofiles.os.path.exists(final_filename):
+                         await aiofiles.os.remove(final_filename)
+                         logger.info(f"Удален исходный файл (кэш отключен): {final_filename}")
+                 except OSError as rm_err:
+                     logger.warning(f"Не удалось удалить исходный файл {final_filename}: {rm_err}")
+            # --- Конец изменений ---
 
     def get_download_progress(self, url):
         """Возвращает прогресс загрузки для указанного URL"""
@@ -374,16 +382,17 @@ class VideoDownloader:
         if filename_to_delete:
             # Пытаемся удалить файл, связанный с отмененной загрузкой
             # Даем небольшую паузу, чтобы файл мог освободиться, если он еще используется
-            # Используем asyncio.sleep (если cancel_download вызывается из async контекста) 
-            # или time.sleep (если из синхронного). Так как вызывается из async callback, используем asyncio.sleep
-            # await asyncio.sleep(0.5) # Это было неверно, т.к. cancel_download - синхронная
             time.sleep(0.5) # Используем time.sleep
             try:
+                # --- Изменено: Асинхронное удаление файла --- 
+                # Используем синхронные операции, т.к. cancel_download не async
+                # TODO: Сделать cancel_download асинхронной для использования aiofiles
                 if os.path.exists(filename_to_delete):
                     os.remove(filename_to_delete)
                     logger.info(f"Deleted cancelled download file: {filename_to_delete}")
                 else:
                     logger.warning(f"Cancelled download file not found: {filename_to_delete}")
+                # --- Конец изменений (оставили синхронный вариант) --- 
             except OSError as rm_err:
                 logger.error(f"Failed to delete cancelled download file {filename_to_delete}: {rm_err}")
         else:
@@ -393,9 +402,9 @@ class VideoDownloader:
         return cancelled_in_dict # Возвращаем True, если запись была найдена и удалена из словаря
         # --- Конец изменений --- 
 
-    def split_large_video(self, file_path, max_segment_size=45):
+    async def split_large_video(self, file_path, max_segment_size=45):
         """
-        Разделяет большие видео на части с использованием FFmpeg.
+        Разделяет большие видео на части с использованием FFmpeg (асинхронные операции с файлами).
         Удален аварийный режим разделения по байтам.
         
         Args:
@@ -408,8 +417,8 @@ class VideoDownloader:
         output_files = []
         temp_files = []
 
-        # Проверяем существование файла
-        if not os.path.exists(file_path):
+        # --- Изменено: Асинхронная проверка файла --- 
+        if not await aiofiles.os.path.exists(file_path):
             logger.error(f"Файл для разделения не найден: {file_path}")
             return []
 
@@ -465,8 +474,9 @@ class VideoDownloader:
                 logger.error(f"Не удалось определить валидную продолжительность для {file_path}. Разделение невозможно.")
                 raise ValueError(f"Не удалось определить продолжительность видео {file_path}")
 
-            # 2. Проверяем размер и необходимость разделения
-            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            # --- Изменено: Асинхронное получение размера --- 
+            stat_result = await aiofiles.os.stat(file_path)
+            file_size_mb = stat_result.st_size / (1024 * 1024)
             if file_size_mb <= max_segment_size:
                 logger.info(f"Файл {file_path} ({file_size_mb:.2f}MB) не требует разделения.")
                 return [file_path]
@@ -508,16 +518,23 @@ class VideoDownloader:
                     logger.info(f"Создание сегмента {i+1}/{segment_count}...")
                     subprocess.run(cmd_ffmpeg, check=True, capture_output=True)
 
-                    # Проверяем, что файл создан и не пустой
-                    if os.path.exists(segment_temp_file) and os.path.getsize(segment_temp_file) > 0:
-                        if os.path.exists(original_segment_file):
-                            os.remove(original_segment_file)
-                        os.rename(segment_temp_file, original_segment_file)
+                    # --- Изменено: Асинхронные операции с файлами --- 
+                    segment_exists = await aiofiles.os.path.exists(segment_temp_file)
+                    segment_size = 0
+                    if segment_exists:
+                         segment_stat = await aiofiles.os.stat(segment_temp_file)
+                         segment_size = segment_stat.st_size
+                         
+                    if segment_exists and segment_size > 0:
+                        if await aiofiles.os.path.exists(original_segment_file):
+                            await aiofiles.os.remove(original_segment_file)
+                        await aiofiles.os.rename(segment_temp_file, original_segment_file)
                         output_files.append(original_segment_file)
-                        if segment_temp_file in temp_files: temp_files.remove(segment_temp_file)
+                        if segment_temp_file in temp_files: temp_files.remove(segment_temp_file) # Удаление из списка - синхронное
                         logger.info(f"Сегмент {i+1} успешно создан: {original_segment_file}")
                     else:
                         logger.error(f"FFmpeg завершился, но сегмент {segment_temp_file} не создан или пуст.")
+                    # --- Конец изменений --- 
 
                 except subprocess.CalledProcessError as ffmpeg_err:
                     logger.error(f"Ошибка FFmpeg при создании сегмента {i+1}: {ffmpeg_err}")
@@ -537,19 +554,20 @@ class VideoDownloader:
             # Удаляем все успешно созданные выходные файлы, так как процесс не завершился полностью
             for f in output_files:
                 try:
-                    if os.path.exists(f): os.remove(f)
+                    if await aiofiles.os.path.exists(f): await aiofiles.os.remove(f)
                 except OSError: pass
             return []
 
         finally:
-            # Гарантированно удаляем все временные файлы ffmpeg (_part<N>)
+            # --- Изменено: Асинхронное удаление файлов --- 
             for temp_f in temp_files:
                 try:
-                    if os.path.exists(temp_f):
-                        os.remove(temp_f)
+                    if await aiofiles.os.path.exists(temp_f):
+                        await aiofiles.os.remove(temp_f)
                         logger.debug(f"Удален временный файл сегмента: {temp_f}")
                 except OSError as rm_err:
                     logger.warning(f"Не удалось удалить временный файл сегмента {temp_f}: {rm_err}")
+            # --- Конец изменений --- 
 
     async def get_optimal_quality(self, url, user_id=None):
         """Определяет оптимальное качество видео на основе доступных форматов и ограничений"""

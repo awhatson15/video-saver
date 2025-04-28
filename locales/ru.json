@@ -37,5 +37,9 @@
   "quality_medium": "среднее",
   "quality_high": "высокое",
   "quality_audio": "аудио",
-  "quality_numeric_format": "Формат {format_id}"
+  "quality_numeric_format": "Формат {format_id}",
+  "error_channel_link": "❌ Пожалуйста, отправьте ссылку на конкретное видео, а не на канал.",
+  "error_playlist_link": "❌ Скачивание плейлистов пока не поддерживается. Отправьте ссылку на видео.",
+  "error_video_unavailable": "❌ Видео недоступно (возможно, удалено или ограничено по региону).",
+  "error_video_private": "❌ Это частное видео, его нельзя скачать."
 } 

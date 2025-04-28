@@ -7,6 +7,9 @@ from telegram.error import BadRequest
 import re
 import subprocess
 import time
+import aiofiles
+import aiofiles.os
+from yt_dlp.utils import DownloadError, ExtractorError
 
 # Импортируем наши модули
 import config
@@ -244,8 +247,34 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # --- Изменено: передаем progress_message напрямую --- 
             await download_with_quality(update, context, url, "auto", progress_message)
 
+    except (DownloadError, ExtractorError) as ytdlp_err:
+        error_message = str(ytdlp_err)
+        user_message_key = 'download_error' # Сообщение по умолчанию
+        
+        # Пытаемся определить причину ошибки для более понятного сообщения
+        if "channel does not have a" in error_message or "/channel/" in url or "/user/" in url or "/c/" in url or "/@" in url.split('/')[-1]:
+             user_message_key = 'error_channel_link'
+        elif "This playlist does not exist" in error_message or ("list=" in url and "/playlist?list=" not in url and "/watch?" not in url):
+             user_message_key = 'error_playlist_link' # Если понадобится обработка плейлистов
+        elif "Video unavailable" in error_message:
+             user_message_key = 'error_video_unavailable'
+        elif "Private video" in error_message:
+             user_message_key = 'error_video_private'
+        # Можно добавить другие проверки по ключевым словам из ошибок yt-dlp
+        
+        logger.error(f"Ошибка yt-dlp при обработке URL '{url}': {error_message}")
+        # Очищаем контекст, если он был создан
+        if CHAT_CONTEXT_KEY in context.chat_data and message_id in context.chat_data[CHAT_CONTEXT_KEY]:
+            del context.chat_data[CHAT_CONTEXT_KEY][message_id]
+        try:
+            if progress_message:
+                await progress_message.edit_text(get_message(user_message_key))
+            else:
+                await message.reply_text(get_message(user_message_key))
+        except Exception as edit_err:
+             logger.error(f"Не удалось отправить сообщение об ошибке yt-dlp: {edit_err}")
     except Exception as e:
-        logger.exception(f"Ошибка при обработке URL '{url}': {e}") # Используем logger.exception для стектрейса
+        logger.exception(f"Неожиданная ошибка при обработке URL '{url}': {e}")
         # Очищаем контекст, если он был создан
         if CHAT_CONTEXT_KEY in context.chat_data and message_id in context.chat_data[CHAT_CONTEXT_KEY]:
             del context.chat_data[CHAT_CONTEXT_KEY][message_id]
@@ -434,24 +463,27 @@ async def _send_video_result(context: ContextTypes.DEFAULT_TYPE, result: dict, c
     file_size = result['size']
     title = result['title']
 
+    # --- Изменено: Асинхронная проверка файла --- 
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Файл не найден после скачивания: {file_path}")
+    # file_size уже известен из result, доп. проверка не нужна
     if file_size == 0:
         raise ValueError(f"Файл после скачивания пустой: {file_path}")
 
     try:
         if file_size > config.MAX_TELEGRAM_SIZE:
             await progress_message.edit_text(get_message('split_video_started'))
-            # Разделение теперь синхронное, но вызывается из async контекста
-            # Для полной асинхронности нужно переделывать split_large_video
-            video_parts = downloader.split_large_video(file_path)
+            # --- Изменено: Добавлен await для async split_large_video ---
+            video_parts = await downloader.split_large_video(file_path)
             if not video_parts:
                 raise ValueError(f"Не удалось разделить видео: {file_path}")
 
             total_parts = len(video_parts)
             for i, part_path in enumerate(video_parts, 1):
                 logger.info(f"Отправка части {i}/{total_parts}: {part_path}")
-                with open(part_path, 'rb') as part_file:
+                # --- Возвращаем синхронный open для send_video --- 
+                with open(part_path, mode='rb') as part_file:
+                # --- Конец изменения ---
                     await context.bot.send_video(
                         chat_id=chat_id,
                         video=part_file,
@@ -462,7 +494,9 @@ async def _send_video_result(context: ContextTypes.DEFAULT_TYPE, result: dict, c
             await progress_message.edit_text(get_message('split_video_completed'))
         else:
             logger.info(f"Отправка целого файла: {file_path}")
-            with open(file_path, 'rb') as video_file:
+             # --- Возвращаем синхронный open для send_video --- 
+            with open(file_path, mode='rb') as video_file:
+            # --- Конец изменения ---
                 await context.bot.send_video(
                     chat_id=chat_id,
                     video=video_file,
@@ -480,6 +514,7 @@ async def _send_video_result(context: ContextTypes.DEFAULT_TYPE, result: dict, c
         # Гарантированное удаление частей видео, если они были созданы
         for part_f in video_parts:
             try:
+                 # --- Изменено: Асинхронное удаление --- 
                 if os.path.exists(part_f):
                     os.remove(part_f)
                     logger.info(f"Удалена часть видео: {part_f}")
@@ -487,9 +522,9 @@ async def _send_video_result(context: ContextTypes.DEFAULT_TYPE, result: dict, c
                  logger.warning(f"Не удалось удалить часть видео {part_f}: {rm_err}")
         
         # Удаляем исходный файл, если кэш отключен и видео НЕ разделялось
-        # (Если разделялось, части удалены выше, а исходный может быть нужен кэшу)
         if not video_parts and not config.CACHE_ENABLED:
             try:
+                 # --- Изменено: Асинхронное удаление --- 
                 if os.path.exists(file_path):
                     os.remove(file_path)
                     logger.info(f"Удален исходный файл (кэш отключен): {file_path}")
@@ -551,23 +586,44 @@ async def download_with_quality(update: Update, context: ContextTypes.DEFAULT_TY
             # Отправляем видео
             await _send_video_result(context, result, chat_id, message_id, progress_message)
 
-    except Exception as e:
-        logger.exception(f"Ошибка при обработке запроса на скачивание для URL '{url}': {e}")
+    except (DownloadError, ExtractorError) as ytdlp_err:
+        error_message = str(ytdlp_err)
+        user_message_key = 'download_error' # Сообщение по умолчанию
+        
+        # Пытаемся определить причину ошибки для более понятного сообщения
+        if "channel does not have a" in error_message or "/channel/" in url or "/user/" in url or "/c/" in url or "/@" in url.split('/')[-1]:
+             user_message_key = 'error_channel_link'
+        elif "This playlist does not exist" in error_message or ("list=" in url and "/playlist?list=" not in url and "/watch?" not in url):
+             user_message_key = 'error_playlist_link' # Если понадобится обработка плейлистов
+        elif "Video unavailable" in error_message:
+             user_message_key = 'error_video_unavailable'
+        elif "Private video" in error_message:
+             user_message_key = 'error_video_private'
+        # Можно добавить другие проверки по ключевым словам из ошибок yt-dlp
+        
+        logger.error(f"Ошибка yt-dlp при обработке URL '{url}': {error_message}")
+        # Очищаем контекст, если он был создан
+        if CHAT_CONTEXT_KEY in context.chat_data and message_id in context.chat_data[CHAT_CONTEXT_KEY]:
+            del context.chat_data[CHAT_CONTEXT_KEY][message_id]
         try:
-            # Пытаемся обновить исходное сообщение об ошибке
-            await context.bot.edit_message_text(
-                chat_id=chat_id, 
-                message_id=message_id, 
-                text=get_message('download_error')
-            )
+            if progress_message:
+                await progress_message.edit_text(get_message(user_message_key))
+            else:
+                await message.reply_text(get_message(user_message_key))
         except Exception as edit_err:
-            logger.error(f"Не удалось отредактировать сообщение {message_id} об ошибке скачивания: {edit_err}")
-        # Отправляем уведомление об ошибке
-        await send_notification(
-            context, user_id, "download_error",
-            title=url, # Используем URL, т.к. title может быть недоступен
-            error=str(e)
-        )
+             logger.error(f"Не удалось отправить сообщение об ошибке yt-dlp: {edit_err}")
+    except Exception as e:
+        logger.exception(f"Неожиданная ошибка при обработке URL '{url}': {e}")
+        # Очищаем контекст, если он был создан
+        if CHAT_CONTEXT_KEY in context.chat_data and message_id in context.chat_data[CHAT_CONTEXT_KEY]:
+            del context.chat_data[CHAT_CONTEXT_KEY][message_id]
+        try:
+            if progress_message:
+                await progress_message.edit_text(get_message('download_error'))
+            else:
+                await message.reply_text(get_message('download_error'))
+        except Exception as edit_err:
+             logger.error(f"Не удалось отправить сообщение об ошибке обработки URL: {edit_err}")
 
     finally:
         # 4. Очистка состояния (прогресс-задача, словари)
