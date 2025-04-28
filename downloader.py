@@ -13,6 +13,7 @@ import threading
 import time
 import aiofiles
 import aiofiles.os
+from urllib.parse import urlparse, urlunparse
 
 # Настройка логирования
 logging.basicConfig(
@@ -29,10 +30,23 @@ db = Database()
 
 # Активные загрузки (для отслеживания прогресса)
 active_downloads = {}
-# Словарь для сопоставления канонических URL (от yt-dlp) с исходными URL (от пользователя)
+# Словарь для сопоставления НОРМАЛИЗОВАННЫХ канонических URL с исходными URL
 canonical_url_map = {}
 # Блокировка для потокобезопасного доступа к словарям выше
 data_lock = threading.Lock()
+
+# --- Добавлено: Функция нормализации URL (дублируем из bot.py для автономности модуля) ---
+def normalize_url(url):
+    """Removes query parameters and fragments from a URL."""
+    if not url: return None
+    try:
+        parsed = urlparse(url)
+        # Reconstruct URL without query and fragment
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+    except Exception as e:
+        logger.warning(f"(Downloader) Не удалось нормализовать URL '{url}': {e}")
+        return url # Возвращаем исходный URL в случае ошибки
+# --- Конец добавления ---
 
 class VideoDownloader:
     def __init__(self):
@@ -117,15 +131,27 @@ class VideoDownloader:
                 logger.warning("Progress hook: URL not found in info_dict.")
                 return
             
-            # --- Изменено: Ищем исходный URL по каноническому ---
+            # --- Изменено: Ищем исходный URL по НОРМАЛИЗОВАННОМУ каноническому --- 
+            normalized_canonical_hook_url = normalize_url(url)
+            if not normalized_canonical_hook_url:
+                 logger.warning(f"Progress hook: Failed to normalize canonical URL '{url}'. Skipping update.")
+                 return
+                 
             with data_lock:
-                original_url = canonical_url_map.get(url)
+                original_url = canonical_url_map.get(normalized_canonical_hook_url)
                 if not original_url:
-                    logger.warning(f"Progress hook: Original URL for canonical '{url}' not found in map. Map: {canonical_url_map}")
+                    # Логируем как нормализованный, так и исходный канонический URL для отладки
+                    logger.warning(f"Progress hook: Cannot find original_url for normalized canonical '{normalized_canonical_hook_url}' (from '{url}') in map. Map keys: {list(canonical_url_map.keys())}")
                     return
                     
                 if original_url not in active_downloads:
-                    logger.warning(f"Progress hook: Original URL '{original_url}' (mapped from '{url}') not found in active_downloads. Current keys: {list(active_downloads.keys())}")
+                    # --- Изменено: Улучшаем логирование для этого случая ---
+                    logger.warning(
+                        f"Progress hook: State for original URL '{original_url}' "
+                        f"(mapped from norm_canon '{normalized_canonical_hook_url}') not found in active_downloads. "
+                        f"This might be due to a race condition if the download just finished or errored. "
+                        f"Current active_downloads keys: {list(active_downloads.keys())}"
+                    )
                     return
                 
                 # --- Перенесено внутрь блокировки: Расчет процента --- 
@@ -154,9 +180,14 @@ class VideoDownloader:
         elif d['status'] == 'finished':
             url = d.get('info_dict', {}).get('webpage_url')
             if url:
-                # --- Изменено: Используем блокировку ---
+                # --- Изменено: Используем блокировку и НОРМАЛИЗОВАННЫЙ URL ---
+                normalized_canonical_hook_url = normalize_url(url)
+                if not normalized_canonical_hook_url:
+                     logger.warning(f"Progress hook (finished): Failed to normalize canonical URL '{url}'. Skipping final update.")
+                     return
+                     
                 with data_lock:
-                    original_url = canonical_url_map.get(url)
+                    original_url = canonical_url_map.get(normalized_canonical_hook_url)
                     if original_url and original_url in active_downloads:
                         active_downloads[original_url]['percent'] = 100
                         active_downloads[original_url]['percent_rounded'] = 100
@@ -227,6 +258,7 @@ class VideoDownloader:
                         'format_preference': ['mp4', 'm4a'],
                         # 'postprocessors': Будут добавлены ниже
                         'merge_output_format': 'mp4', # По умолчанию mp4
+                        'file_access_retries': 10, # Увеличиваем кол-во попыток доступа к файлу
                     }
                     
                     if video_format != 'audio':
@@ -248,6 +280,7 @@ class VideoDownloader:
                                 logger.info(f"Trying fallback format: {config.DEFAULT_VIDEO_FORMAT}")
                                 fallback_opts = ydl_opts_dict.copy()
                                 fallback_opts['format'] = config.DEFAULT_VIDEO_FORMAT
+                                # file_access_retries уже скопирован
                                 if video_format != 'audio': # Убедимся, что фоллбэк тоже конвертирует в mp4 если не аудио
                                      fallback_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor','preferedformat': 'mp4'}]
                                      fallback_opts['merge_output_format'] = 'mp4'
@@ -402,14 +435,14 @@ class VideoDownloader:
         return cancelled_in_dict # Возвращаем True, если запись была найдена и удалена из словаря
         # --- Конец изменений --- 
 
-    async def split_large_video(self, file_path, max_segment_size=45):
+    async def split_large_video(self, file_path, max_segment_size=35):
         """
         Разделяет большие видео на части с использованием FFmpeg (асинхронные операции с файлами).
         Удален аварийный режим разделения по байтам.
         
         Args:
             file_path: Путь к исходному видео
-            max_segment_size: Максимальный размер сегмента в MB (по умолчанию 45MB)
+            max_segment_size: Максимальный размер сегмента в MB (по умолчанию 35MB)
             
         Returns:
             list: Список путей к созданным файлам частей
@@ -604,3 +637,47 @@ class VideoDownloader:
         except Exception as e:
             logger.error(f"Ошибка при определении оптимального качества: {e}")
             return "high"  # Возвращаем высокое качество по умолчанию в случае ошибки 
+
+    async def get_playlist_info(self, playlist_url):
+        """Получение информации о плейлисте (название, список видео URL)."""
+        try:
+            loop = asyncio.get_event_loop()
+            ydl_opts = {
+                'quiet': True,
+                'extract_flat': 'in_playlist', # Получаем только базовую информацию о видео в плейлисте
+                'force_generic_extractor': False,
+            }
+
+            def _extract_playlist_info():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    # Не используем download=False, extract_flat сам это подразумевает
+                    return ydl.extract_info(playlist_url)
+            
+            info = await loop.run_in_executor(executor, _extract_playlist_info)
+            
+            entries = []
+            if info and 'entries' in info:
+                for entry in info.get('entries', []):
+                    # Пропускаем недоступные видео (например, удаленные)
+                    if entry and entry.get('url'):
+                         entries.append({
+                             'url': entry['url'],
+                             'title': entry.get('title', 'Видео без названия')
+                         })
+            
+            return {
+                'title': info.get('title', 'Плейлист без названия'),
+                'entries': entries
+            }
+
+        except yt_dlp.utils.DownloadError as e:
+            # Обрабатываем случай, если плейлист не найден или недоступен
+             if "This playlist does not exist or is private" in str(e) or "confirm your age" in str(e):
+                  logger.warning(f"Ошибка получения информации о плейлисте {playlist_url}: {e}")
+                  raise ValueError(f"Плейлист не найден или недоступен: {playlist_url}") from e
+             else:
+                  logger.error(f"Ошибка yt-dlp при получении информации о плейлисте {playlist_url}: {e}")
+                  raise # Перебрасываем другие ошибки yt-dlp
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при получении информации о плейлисте {playlist_url}: {e}")
+            raise 
