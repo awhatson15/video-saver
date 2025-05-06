@@ -87,7 +87,10 @@ class VideoDownloader:
                 # Метод 1: Стандартный способ
                 try:
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        return ydl.extract_info(url, download=False)
+                        info = ydl.extract_info(url, download=False)
+                        if info is not None:
+                            return info
+                        errors.append("Стандартный метод вернул None")
                 except Exception as e:
                     errors.append(f"Стандартный метод не сработал: {str(e)}")
                 
@@ -96,7 +99,10 @@ class VideoDownloader:
                     opts_with_agent = ydl_opts.copy()
                     opts_with_agent['user_agent'] = 'Mozilla/5.0 (Android 12; Mobile; rv:109.0) Gecko/113.0 Firefox/113.0'
                     with yt_dlp.YoutubeDL(opts_with_agent) as ydl:
-                        return ydl.extract_info(url, download=False)
+                        info = ydl.extract_info(url, download=False)
+                        if info is not None:
+                            return info
+                        errors.append("Метод с user-agent вернул None")
                 except Exception as e:
                     errors.append(f"Метод с user-agent не сработал: {str(e)}")
                 
@@ -116,15 +122,48 @@ class VideoDownloader:
                             invidious_url = f"https://invidious.snopyta.org/watch?v={video_id}"
                             logger.info(f"Пробуем через инвидиус: {invidious_url}")
                             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                                return ydl.extract_info(invidious_url, download=False)
+                                info = ydl.extract_info(invidious_url, download=False)
+                                if info is not None:
+                                    return info
+                                errors.append("Метод через инвидиус вернул None")
                         except Exception as e:
                             errors.append(f"Метод через инвидиус не сработал: {str(e)}")
+
+                        # Пробуем другие инвидиус-зеркала
+                        try:
+                            invidious_url2 = f"https://yewtu.be/watch?v={video_id}"
+                            logger.info(f"Пробуем через yewtu.be: {invidious_url2}")
+                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                info = ydl.extract_info(invidious_url2, download=False)
+                                if info is not None:
+                                    return info
+                                errors.append("Метод через yewtu.be вернул None")
+                        except Exception as e:
+                            errors.append(f"Метод через yewtu.be не сработал: {str(e)}")
+
+                        # Попытка через NewPipe API
+                        try:
+                            piped_url = f"https://piped.kavin.rocks/watch?v={video_id}"
+                            logger.info(f"Пробуем через Piped API: {piped_url}")
+                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                info = ydl.extract_info(piped_url, download=False)
+                                if info is not None:
+                                    return info
+                                errors.append("Метод через Piped API вернул None")
+                        except Exception as e:
+                            errors.append(f"Метод через Piped API не сработал: {str(e)}")
                 
                 # Выбрасываем ошибку с деталями всех неудачных попыток
                 err_msg = "\n".join(errors)
-                raise Exception(f"Не удалось получить информацию о видео после нескольких попыток:\n{err_msg}")
+                logger.error(f"Все методы получения информации о видео для URL '{url}' не сработали:\n{err_msg}")
+                raise ValueError(f"Не удалось получить информацию о видео после нескольких попыток:\n{err_msg}")
             
             info = await loop.run_in_executor(executor, _extract_info)
+            
+            # Проверяем, что info не None
+            if info is None:
+                logger.error("get_video_info: _extract_info вернул None вместо информации о видео")
+                raise ValueError("Не удалось получить информацию о видео после нескольких попыток")
             
             # Получаем список доступных форматов
             formats = []
@@ -343,6 +382,9 @@ class VideoDownloader:
                             logger.info(f"Attempting download with format: {ydl_opts_dict.get('format')}")
                             with yt_dlp.YoutubeDL(ydl_opts_dict) as ydl:
                                 info = ydl.extract_info(url, download=True)
+                                if info is None:
+                                    logger.warning("Стандартный метод загрузки вернул None")
+                                    raise ValueError("Стандартный метод загрузки вернул None")
                                 return info, ydl.prepare_filename(info)
                         except Exception as e:
                             logger.warning(f"Standard download failed: {e}")
@@ -354,6 +396,9 @@ class VideoDownloader:
                             agent_opts['user_agent'] = 'Mozilla/5.0 (Android 12; Mobile; rv:109.0) Gecko/113.0 Firefox/113.0'
                             with yt_dlp.YoutubeDL(agent_opts) as ydl:
                                 info = ydl.extract_info(url, download=True)
+                                if info is None:
+                                    logger.warning("User-agent метод загрузки вернул None")
+                                    raise ValueError("User-agent метод загрузки вернул None")
                                 return info, ydl.prepare_filename(info)
                         except Exception as e:
                             logger.warning(f"User-agent method failed: {e}")
@@ -369,14 +414,19 @@ class VideoDownloader:
                                 video_id = url.split('shorts/')[1].split('?')[0]
                                 
                             if video_id:
-                                try:
-                                    invidious_url = f"https://invidious.snopyta.org/watch?v={video_id}"
-                                    logger.info(f"Trying download via invidious: {invidious_url}")
-                                    with yt_dlp.YoutubeDL(ydl_opts_dict) as ydl:
-                                        info = ydl.extract_info(invidious_url, download=True)
-                                        return info, ydl.prepare_filename(info)
-                                except Exception as e:
-                                    logger.warning(f"Invidious method failed: {e}")
+                                # Пробуем все известные инвидиус-зеркала
+                                for invidious_domain in ["invidious.snopyta.org", "yewtu.be", "piped.kavin.rocks", "inv.riverside.rocks"]:
+                                    try:
+                                        invidious_url = f"https://{invidious_domain}/watch?v={video_id}"
+                                        logger.info(f"Trying download via {invidious_domain}: {invidious_url}")
+                                        with yt_dlp.YoutubeDL(ydl_opts_dict) as ydl:
+                                            info = ydl.extract_info(invidious_url, download=True)
+                                            if info is None:
+                                                logger.warning(f"Метод через {invidious_domain} вернул None")
+                                                continue
+                                            return info, ydl.prepare_filename(info)
+                                    except Exception as e:
+                                        logger.warning(f"Метод через {invidious_domain} не сработал: {e}")
                             
                         # Метод 4: Фоллбэк формат (если всё остальное не сработало)
                         logger.info(f"Trying fallback format: {config.DEFAULT_VIDEO_FORMAT}")
@@ -388,10 +438,17 @@ class VideoDownloader:
                         else:
                             fallback_opts['postprocessors'] = []
                             fallback_opts['merge_output_format'] = None
-                            
-                        with yt_dlp.YoutubeDL(fallback_opts) as fallback_ydl:
-                            info = fallback_ydl.extract_info(url, download=True)
-                            return info, fallback_ydl.prepare_filename(info)
+                        
+                        # Последняя попытка
+                        try:    
+                            with yt_dlp.YoutubeDL(fallback_opts) as fallback_ydl:
+                                info = fallback_ydl.extract_info(url, download=True)
+                                if info is None:
+                                    raise ValueError("Fallback загрузка вернула None")
+                                return info, fallback_ydl.prepare_filename(info)
+                        except Exception as e:
+                            logger.error(f"Все методы загрузки для {url} не сработали: {e}")
+                            raise ValueError(f"Не удалось скачать видео после всех попыток: {e}")
 
                     # Пробуем скачать с разными методами
                     return download_with_retries()
@@ -768,7 +825,11 @@ class VideoDownloader:
                 # Метод 1: Стандартный способ
                 try:
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        return ydl.extract_info(playlist_url)
+                        info = ydl.extract_info(playlist_url)
+                        if info is None:
+                            logger.warning(f"Стандартный метод получения плейлиста вернул None для {playlist_url}")
+                            raise ValueError("Получен None от стандартного метода")
+                        return info
                 except Exception as e:
                     logger.warning(f"Standard playlist extraction failed: {e}")
                     
@@ -777,25 +838,42 @@ class VideoDownloader:
                     agent_opts = ydl_opts.copy()
                     agent_opts['user_agent'] = 'Mozilla/5.0 (Android 12; Mobile; rv:109.0) Gecko/113.0 Firefox/113.0'
                     with yt_dlp.YoutubeDL(agent_opts) as ydl:
-                        return ydl.extract_info(playlist_url)
+                        info = ydl.extract_info(playlist_url)
+                        if info is None:
+                            logger.warning(f"User-agent метод получения плейлиста вернул None для {playlist_url}")
+                            raise ValueError("Получен None от user-agent метода")
+                        return info
                 except Exception as e:
                     logger.warning(f"User-agent playlist method failed: {e}")
                     
                 # Метод 3: Через альтернативный фронтенд, если это YouTube плейлист
                 if 'youtube.com/playlist' in playlist_url and 'list=' in playlist_url:
                     playlist_id = playlist_url.split('list=')[1].split('&')[0]
-                    try:
-                        invidious_url = f"https://invidious.snopyta.org/playlist?list={playlist_id}"
-                        logger.info(f"Trying playlist via invidious: {invidious_url}")
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            return ydl.extract_info(invidious_url)
-                    except Exception as e:
-                        logger.warning(f"Invidious playlist method failed: {e}")
+                    
+                    # Пробуем разные инвидиус-зеркала
+                    for invidious_domain in ["invidious.snopyta.org", "yewtu.be", "piped.kavin.rocks", "inv.riverside.rocks"]:
+                        try:
+                            invidious_url = f"https://{invidious_domain}/playlist?list={playlist_id}"
+                            logger.info(f"Trying playlist via {invidious_domain}: {invidious_url}")
+                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                info = ydl.extract_info(invidious_url)
+                                if info is None:
+                                    logger.warning(f"Метод через {invidious_domain} для плейлиста вернул None")
+                                    continue
+                                return info
+                        except Exception as e:
+                            logger.warning(f"Метод через {invidious_domain} для плейлиста не сработал: {e}")
                 
                 # Если все методы не сработали, повторно вызываем исключение
-                raise ValueError(f"Failed to extract playlist info after multiple attempts")
+                logger.error(f"Все методы получения информации о плейлисте {playlist_url} не сработали")
+                raise ValueError(f"Failed to extract playlist info after multiple attempts for {playlist_url}")
             
             info = await loop.run_in_executor(executor, _extract_playlist_info)
+            
+            # Проверка на None
+            if info is None:
+                logger.error(f"get_playlist_info: _extract_playlist_info вернул None для {playlist_url}")
+                raise ValueError(f"Не удалось получить информацию о плейлисте {playlist_url}")
             
             entries = []
             if info and 'entries' in info:
