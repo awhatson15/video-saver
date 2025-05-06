@@ -55,7 +55,7 @@ sudo apt update && sudo apt install ffmpeg
 
 1. Клонируйте репозиторий:
 ```bash
-git clone https://github.com/username/video-downloader-bot.git
+git clone https://github.com/awhatson15/video-saver.git
 cd video-downloader-bot
 ```
 
