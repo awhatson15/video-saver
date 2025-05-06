@@ -64,6 +64,11 @@ class VideoDownloader:
                 'listformats': True,  # Включаем список форматов
                 'no_warnings': True,
                 'extract_flat': False,  # Получаем полную информацию
+                'nocheckcertificate': True,
+                'ignoreerrors': True,
+                'no_color': True,
+                'geo_bypass': True,
+                'geo_bypass_country': 'US'
             }
             
             def _extract_info():
