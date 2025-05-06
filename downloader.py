@@ -68,12 +68,61 @@ class VideoDownloader:
                 'ignoreerrors': True,
                 'no_color': True,
                 'geo_bypass': True,
-                'geo_bypass_country': 'US'
+                'geo_bypass_country': 'US',
+                'source_address': '0.0.0.0',  # Используем любой доступный IP
+                'socket_timeout': 15,  # Увеличиваем таймаут
+                'extractor_retries': 5,  # Повторные попытки извлечения
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android'],  # Эмуляция Android-клиента
+                        'skip': ['hls', 'dash']  # Пропускаем некоторые проблемные форматы
+                    }
+                }
             }
             
             def _extract_info():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    return ydl.extract_info(url, download=False)
+                # Пробуем разные методы последовательно
+                errors = []
+                
+                # Метод 1: Стандартный способ
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        return ydl.extract_info(url, download=False)
+                except Exception as e:
+                    errors.append(f"Стандартный метод не сработал: {str(e)}")
+                
+                # Метод 2: Пробуем с другим user-agent
+                try:
+                    opts_with_agent = ydl_opts.copy()
+                    opts_with_agent['user_agent'] = 'Mozilla/5.0 (Android 12; Mobile; rv:109.0) Gecko/113.0 Firefox/113.0'
+                    with yt_dlp.YoutubeDL(opts_with_agent) as ydl:
+                        return ydl.extract_info(url, download=False)
+                except Exception as e:
+                    errors.append(f"Метод с user-agent не сработал: {str(e)}")
+                
+                # Метод 3: Если это YouTube, пробуем через инвидиус
+                if 'youtube.com' in url or 'youtu.be' in url:
+                    video_id = None
+                    if 'youtube.com/watch' in url and 'v=' in url:
+                        video_id = url.split('v=')[1].split('&')[0]
+                    elif 'youtu.be/' in url:
+                        video_id = url.split('youtu.be/')[1].split('?')[0]
+                    elif 'youtube.com/shorts/' in url:
+                        video_id = url.split('shorts/')[1].split('?')[0]
+                        
+                    if video_id:
+                        try:
+                            # Пробуем через инвидиус
+                            invidious_url = f"https://invidious.snopyta.org/watch?v={video_id}"
+                            logger.info(f"Пробуем через инвидиус: {invidious_url}")
+                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                return ydl.extract_info(invidious_url, download=False)
+                        except Exception as e:
+                            errors.append(f"Метод через инвидиус не сработал: {str(e)}")
+                
+                # Выбрасываем ошибку с деталями всех неудачных попыток
+                err_msg = "\n".join(errors)
+                raise Exception(f"Не удалось получить информацию о видео после нескольких попыток:\n{err_msg}")
             
             info = await loop.run_in_executor(executor, _extract_info)
             
@@ -264,6 +313,21 @@ class VideoDownloader:
                         # 'postprocessors': Будут добавлены ниже
                         'merge_output_format': 'mp4', # По умолчанию mp4
                         'file_access_retries': 10, # Увеличиваем кол-во попыток доступа к файлу
+                        # Добавляем параметры обхода блокировок
+                        'nocheckcertificate': True,
+                        'ignoreerrors': True,
+                        'no_color': True,
+                        'geo_bypass': True,
+                        'geo_bypass_country': 'US',
+                        'source_address': '0.0.0.0',  # Используем любой доступный IP
+                        'socket_timeout': 15,  # Увеличиваем таймаут
+                        'extractor_retries': 5,  # Повторные попытки извлечения
+                        'extractor_args': {
+                            'youtube': {
+                                'player_client': ['android'],  # Эмуляция Android-клиента
+                                'skip': ['hls', 'dash']  # Пропускаем некоторые проблемные форматы
+                            }
+                        }
                     }
                     
                     if video_format != 'audio':
@@ -272,34 +336,66 @@ class VideoDownloader:
                          ydl_opts_dict['postprocessors'] = []
                          ydl_opts_dict['merge_output_format'] = None # Не нужно объединять для аудио
 
-                    with yt_dlp.YoutubeDL(ydl_opts_dict) as ydl:
+                    # Функция для попыток скачивания с разными методами
+                    def download_with_retries():
+                        # Метод 1: Стандартный способ
                         try:
                             logger.info(f"Attempting download with format: {ydl_opts_dict.get('format')}")
-                            info = ydl.extract_info(url, download=True)
-                            downloaded_filename = ydl.prepare_filename(info)
-                            return info, downloaded_filename
+                            with yt_dlp.YoutubeDL(ydl_opts_dict) as ydl:
+                                info = ydl.extract_info(url, download=True)
+                                return info, ydl.prepare_filename(info)
                         except Exception as e:
-                            logger.warning(f"Download failed with format '{ydl_opts_dict.get('format')}': {e}")
-                            # Логика фоллбэка (остается прежней)
-                            if ydl_opts_dict.get('format') != config.DEFAULT_VIDEO_FORMAT:
-                                logger.info(f"Trying fallback format: {config.DEFAULT_VIDEO_FORMAT}")
-                                fallback_opts = ydl_opts_dict.copy()
-                                fallback_opts['format'] = config.DEFAULT_VIDEO_FORMAT
-                                # file_access_retries уже скопирован
-                                if video_format != 'audio': # Убедимся, что фоллбэк тоже конвертирует в mp4 если не аудио
-                                     fallback_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor','preferedformat': 'mp4'}]
-                                     fallback_opts['merge_output_format'] = 'mp4'
-                                else:
-                                    fallback_opts['postprocessors'] = []
-                                    fallback_opts['merge_output_format'] = None
+                            logger.warning(f"Standard download failed: {e}")
+                            
+                        # Метод 2: С другим user-agent
+                        try:
+                            logger.info("Trying download with custom user-agent")
+                            agent_opts = ydl_opts_dict.copy()
+                            agent_opts['user_agent'] = 'Mozilla/5.0 (Android 12; Mobile; rv:109.0) Gecko/113.0 Firefox/113.0'
+                            with yt_dlp.YoutubeDL(agent_opts) as ydl:
+                                info = ydl.extract_info(url, download=True)
+                                return info, ydl.prepare_filename(info)
+                        except Exception as e:
+                            logger.warning(f"User-agent method failed: {e}")
+                            
+                        # Метод 3: Через альтернативный фронтенд, если это YouTube
+                        if 'youtube.com' in url or 'youtu.be' in url:
+                            video_id = None
+                            if 'youtube.com/watch' in url and 'v=' in url:
+                                video_id = url.split('v=')[1].split('&')[0]
+                            elif 'youtu.be/' in url:
+                                video_id = url.split('youtu.be/')[1].split('?')[0]
+                            elif 'youtube.com/shorts/' in url:
+                                video_id = url.split('shorts/')[1].split('?')[0]
                                 
-                                with yt_dlp.YoutubeDL(fallback_opts) as fallback_ydl:
-                                    info = fallback_ydl.extract_info(url, download=True)
-                                    downloaded_filename = fallback_ydl.prepare_filename(info)
-                                    return info, downloaded_filename
-                            else:
-                                logger.error(f"Fallback download with format '{config.DEFAULT_VIDEO_FORMAT}' also failed.")
-                                raise e
+                            if video_id:
+                                try:
+                                    invidious_url = f"https://invidious.snopyta.org/watch?v={video_id}"
+                                    logger.info(f"Trying download via invidious: {invidious_url}")
+                                    with yt_dlp.YoutubeDL(ydl_opts_dict) as ydl:
+                                        info = ydl.extract_info(invidious_url, download=True)
+                                        return info, ydl.prepare_filename(info)
+                                except Exception as e:
+                                    logger.warning(f"Invidious method failed: {e}")
+                            
+                        # Метод 4: Фоллбэк формат (если всё остальное не сработало)
+                        logger.info(f"Trying fallback format: {config.DEFAULT_VIDEO_FORMAT}")
+                        fallback_opts = ydl_opts_dict.copy()
+                        fallback_opts['format'] = config.DEFAULT_VIDEO_FORMAT
+                        if video_format != 'audio':
+                            fallback_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor','preferedformat': 'mp4'}]
+                            fallback_opts['merge_output_format'] = 'mp4'
+                        else:
+                            fallback_opts['postprocessors'] = []
+                            fallback_opts['merge_output_format'] = None
+                            
+                        with yt_dlp.YoutubeDL(fallback_opts) as fallback_ydl:
+                            info = fallback_ydl.extract_info(url, download=True)
+                            return info, fallback_ydl.prepare_filename(info)
+
+                    # Пробуем скачать с разными методами
+                    return download_with_retries()
+                        
                 except Exception as download_err:
                      logger.error(f"Error in _download thread for {url}: {download_err}")
                      # Важно пробросить исключение, чтобы основной поток его увидел
@@ -651,12 +747,53 @@ class VideoDownloader:
                 'quiet': True,
                 'extract_flat': 'in_playlist', # Получаем только базовую информацию о видео в плейлисте
                 'force_generic_extractor': False,
+                # Добавляем параметры обхода блокировок
+                'nocheckcertificate': True,
+                'ignoreerrors': True,
+                'no_color': True,
+                'geo_bypass': True,
+                'geo_bypass_country': 'US',
+                'source_address': '0.0.0.0',
+                'socket_timeout': 15,
+                'extractor_retries': 5,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': ['android'],
+                        'skip': ['hls', 'dash']
+                    }
+                }
             }
 
             def _extract_playlist_info():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    # Не используем download=False, extract_flat сам это подразумевает
-                    return ydl.extract_info(playlist_url)
+                # Метод 1: Стандартный способ
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        return ydl.extract_info(playlist_url)
+                except Exception as e:
+                    logger.warning(f"Standard playlist extraction failed: {e}")
+                    
+                # Метод 2: С другим user-agent
+                try:
+                    agent_opts = ydl_opts.copy()
+                    agent_opts['user_agent'] = 'Mozilla/5.0 (Android 12; Mobile; rv:109.0) Gecko/113.0 Firefox/113.0'
+                    with yt_dlp.YoutubeDL(agent_opts) as ydl:
+                        return ydl.extract_info(playlist_url)
+                except Exception as e:
+                    logger.warning(f"User-agent playlist method failed: {e}")
+                    
+                # Метод 3: Через альтернативный фронтенд, если это YouTube плейлист
+                if 'youtube.com/playlist' in playlist_url and 'list=' in playlist_url:
+                    playlist_id = playlist_url.split('list=')[1].split('&')[0]
+                    try:
+                        invidious_url = f"https://invidious.snopyta.org/playlist?list={playlist_id}"
+                        logger.info(f"Trying playlist via invidious: {invidious_url}")
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            return ydl.extract_info(invidious_url)
+                    except Exception as e:
+                        logger.warning(f"Invidious playlist method failed: {e}")
+                
+                # Если все методы не сработали, повторно вызываем исключение
+                raise ValueError(f"Failed to extract playlist info after multiple attempts")
             
             info = await loop.run_in_executor(executor, _extract_playlist_info)
             

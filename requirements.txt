@@ -1,5 +1,5 @@
 python-telegram-bot==22.0
-yt-dlp==2025.03.31
+yt-dlp==2025.04.30
 python-dotenv==1.0.1
 requests==2.31.0
 aiofiles>=23.1.0 
