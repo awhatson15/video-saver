@@ -466,18 +466,15 @@ async def handle_playlist_url(update: Update, context: ContextTypes.DEFAULT_TYPE
             'playlist_url': playlist_url,
             'video_urls': video_urls
         }
-        logger.debug(f"Сохранены данные плейлиста '{playlist_title}' ({
-                     video_count} видео) для message_id {message_id}")
+        logger.debug(f"Сохранены данные плейлиста '{playlist_title}' ({video_count} видео) для message_id {message_id}")
 
         keyboard = [
-            [
-    InlineKeyboardButton(
-        get_message(
-            'playlist_confirm_button',
-            count=video_count),
-             callback_data=f"pl_confirm_{message_id}")],
-            [InlineKeyboardButton(get_message(
-                'playlist_cancel_button'), callback_data=f"pl_cancel_{message_id}")]
+            [InlineKeyboardButton(
+                get_message('playlist_confirm_button', count=video_count),
+                callback_data=f"pl_confirm_{message_id}")],
+            [InlineKeyboardButton(
+                get_message('playlist_cancel_button'), 
+                callback_data=f"pl_cancel_{message_id}")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -491,19 +488,15 @@ async def handle_playlist_url(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
     except ValueError as ve:
-         logger.warning(f"Ошибка получения информации о плейлисте {
-                        playlist_url}: {ve}")
+         logger.warning(f"Ошибка получения информации о плейлисте {playlist_url}: {ve}")
          await status_message.edit_text(get_message('playlist_not_found'))
     except (DownloadError, ExtractorError) as ytdlp_err:
-         logger.error(
-    f"Ошибка yt-dlp при получении инфо плейлиста '{playlist_url}': {ytdlp_err}")
+         logger.error(f"Ошибка yt-dlp при получении инфо плейлиста '{playlist_url}': {ytdlp_err}")
          await status_message.edit_text(get_message('playlist_fetch_error'))
     except Exception as e:
-        logger.exception(f"Неожиданная ошибка при обработке плейлиста '{
-                         playlist_url}': {e}")
+        logger.exception(f"Неожиданная ошибка при обработке плейлиста '{playlist_url}': {e}")
         await status_message.edit_text(get_message('download_error'))
-        if PLAYLIST_CONTEXT_KEY in context.chat_data and message_id in context.chat_data[
-            PLAYLIST_CONTEXT_KEY]:
+        if PLAYLIST_CONTEXT_KEY in context.chat_data and message_id in context.chat_data[PLAYLIST_CONTEXT_KEY]:
             del context.chat_data[PLAYLIST_CONTEXT_KEY][message_id]
 
 # --- Конец новой функции ---
