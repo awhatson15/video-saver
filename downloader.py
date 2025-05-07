@@ -235,7 +235,7 @@ class VideoDownloader:
                         logger.debug(f"Progress hook marked finished for URL '{original_url}' (canonical: '{url}'). Filename: {d.get('filename')}")
                 # --- Конец изменений ---
 
-    async def download_video(self, url, format_id, user_id, chat_id=None, message_id=None):
+    async def download_video(self, url, format_id, user_id, chat_id=None, message_id=None, ydl_opts=None):
         """Скачивает видео с указанным форматом."""
         try:
             # Создаем директорию для пользователя, если она не существует
@@ -255,26 +255,75 @@ class VideoDownloader:
             # Добавляем ID пользователя в опции
             base_opts['user_id'] = user_id
             
-            # Опции для формата
-            if format_id == 'audio':
-                format_opts = {'format': 'bestaudio/best'}
-            elif format_id == 'auto':
-                format_opts = {'format': 'best'}
+            # Опции для формата (если не переданы в ydl_opts)
+            if not ydl_opts or 'format' not in ydl_opts:
+                if format_id == 'audio':
+                    format_opts = {'format': 'bestaudio/best'}
+                elif format_id == 'auto' or format_id == 'best':
+                    format_opts = {'format': 'best'}
+                else:
+                    format_opts = {'format': format_id}
+                
+                # Объединяем базовые опции с опциями формата
+                final_opts = {**base_opts, **format_opts}
             else:
-                format_opts = {'format': format_id}
-            
-            # Объединяем опции
-            ydl_opts = {**base_opts, **format_opts}
+                # Если переданы собственные опции для yt-dlp, используем их
+                # но предварительно обеспечиваем сохранение базовых настроек
+                final_opts = {**base_opts, **ydl_opts}
             
             # Логируем опции для отладки
-            logger.debug(f"Опции для yt-dlp: {ydl_opts}")
+            logger.info(f"Опции для yt-dlp: {final_opts}")
+            
+            # Добавляем информацию о загрузке в активные загрузки
+            with data_lock:
+                if url not in active_downloads:
+                    active_downloads[url] = {
+                        'status': 'initializing',
+                        'percent': 0,
+                        'percent_rounded': 0,
+                        'downloaded_bytes': 0,
+                        'total_bytes': 0,
+                        'total_bytes_estimate': 0,
+                        'speed': 0,
+                        'eta': 0,
+                        'filename': '',
+                        'last_update': time.time(),
+                        'cancelled': False,
+                        'user_id': user_id,
+                        'chat_id': chat_id,
+                        'message_id': message_id
+                    }
             
             # Скачиваем видео
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(final_opts) as ydl:
                 # Получаем информацию о видео
                 info = ydl.extract_info(url, download=False)
                 
+                # Сохраняем канонический URL
+                with data_lock:
+                    if url in active_downloads and 'webpage_url' in info:
+                        # Преобразуем канонический URL в ключ для карты
+                        canonical_url = info['webpage_url']
+                        normalized_canonical = normalize_url(canonical_url)
+                        if normalized_canonical:
+                            # Сохраняем соответствие нормализованного канонического URL оригинальному
+                            canonical_url_map[normalized_canonical] = url
+                            # Сохраняем канонический URL в информации о загрузке
+                            active_downloads[url]['canonical_url'] = canonical_url
+                
                 # Скачиваем видео
+                if 'webpage_url' in info:
+                    logger.info(f"Начинаем загрузку видео с URL {info['webpage_url']}")
+                    # Сначала проверяем, не отменена ли загрузка
+                    with data_lock:
+                        if url in active_downloads and active_downloads[url]['cancelled']:
+                            logger.info(f"Загрузка для {url} была отменена перед началом скачивания")
+                            return {
+                                'success': False,
+                                'error': 'Загрузка была отменена пользователем'
+                            }
+                
+                # Начинаем загрузку
                 ydl.download([url])
                 
                 # Получаем имя файла

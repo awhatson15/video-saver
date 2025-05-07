@@ -330,13 +330,8 @@ async def handle_single_video_url(update: Update, context: ContextTypes.DEFAULT_
             
             # Отбираем видео форматы
             if vcodec != 'none' and height > 0:
-                # Для YouTube: пропускаем форматы без аудио только если есть форматы с аудио
-                if acodec == 'none' and 'youtube' in url.lower():
-                    # Добавляем в видео-форматы только если в формате указано "видео"
-                    if 'video only' in fmt.get('format', '').lower():
-                        video_formats.append(fmt)
-                else:
-                    video_formats.append(fmt)
+                # Добавляем все форматы с видеокодеком и высотой
+                video_formats.append(fmt)
             
             # Отбираем аудио форматы
             elif vcodec == 'none' and acodec != 'none':
@@ -388,14 +383,38 @@ async def handle_single_video_url(update: Update, context: ContextTypes.DEFAULT_
             format_id = best_format.get('format_id')
             ext = best_format.get('ext', 'mp4')
             filesize = best_format.get('filesize', 0)
-            filesize_str = format_size(filesize) if filesize else "N/A"
             
             # Создаем текст для кнопки
-            button_text = f"{height}p ({filesize_str})"
+            if filesize:
+                filesize_str = format_size(filesize)
+                button_text = f"{height}p ({filesize_str})"
+            else:
+                # Пытаемся получить другую полезную информацию
+                tbr = best_format.get('tbr', 0)  # битрейт в Kb/s
+                if tbr:
+                    button_text = f"{height}p ({tbr} Kb/s)"
+                else:
+                    # Если нет ни размера, ни битрейта, показываем только разрешение
+                    button_text = f"{height}p"
+                
+                # Добавляем индикатор источника для RuTube
+                if 'rutube' in url.lower():
+                    button_text += " 🇷🇺"
             
             # Создаем callback_data с хешем URL
-            url_hash = hashlib.md5(url.encode()).hexdigest()
-            callback_data = f"download_{url_hash}_{format_id}_{user_id}"
+            url_hash = hashlib.md5(url.encode()).hexdigest()[:10]  # Уменьшаем размер хеша до 10 символов
+            
+            # Ограничиваем размер format_id, если он слишком длинный
+            format_id_short = format_id
+            if len(format_id) > 20:  # Если format_id слишком длинный
+                format_id_short = format_id[:20]  # Берем только первые 20 символов
+            
+            callback_data = f"download_{url_hash}_{format_id_short}_{user_id}"
+            
+            # Проверяем длину callback_data и при необходимости укорачиваем
+            if len(callback_data.encode('utf-8')) > 60:  # Оставляем небольшой запас от лимита в 64 байта
+                format_id_short = format_id[:10]  # Еще больше сокращаем format_id
+                callback_data = f"download_{url_hash}_{format_id_short}_{user_id}"
             
             # Добавляем кнопку
             keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
@@ -406,13 +425,38 @@ async def handle_single_video_url(update: Update, context: ContextTypes.DEFAULT_
             audio_format_id = best_audio.get('format_id')
             audio_ext = best_audio.get('ext', 'mp3')
             audio_bitrate = best_audio.get('abr', 0)
-            audio_bitrate_str = f"{audio_bitrate}kbps" if audio_bitrate else "N/A"
             
-            url_hash = hashlib.md5(url.encode()).hexdigest()
-            keyboard.append([InlineKeyboardButton(f"🎵 Аудио ({audio_bitrate_str})", callback_data=f"download_{url_hash}_{audio_format_id}_{user_id}")])
+            # Создаем текст кнопки для аудио
+            if audio_bitrate:
+                audio_bitrate_str = f"{audio_bitrate}kbps"
+            else:
+                audio_bitrate_str = "Аудио"
+                
+            audio_button_text = f"🎵 {audio_bitrate_str}"
+            
+            # Добавляем индикатор источника для RuTube
+            if 'rutube' in url.lower():
+                audio_button_text += " 🇷🇺"
+            
+            # Уменьшаем размер хеша и format_id для аудио
+            url_hash = hashlib.md5(url.encode()).hexdigest()[:10]
+            
+            # Ограничиваем размер audio_format_id при необходимости
+            audio_format_id_short = audio_format_id
+            if len(audio_format_id) > 20:
+                audio_format_id_short = audio_format_id[:20]
+                
+            audio_callback_data = f"download_{url_hash}_{audio_format_id_short}_{user_id}"
+            
+            # Проверяем длину callback_data
+            if len(audio_callback_data.encode('utf-8')) > 60:
+                audio_format_id_short = audio_format_id[:10]
+                audio_callback_data = f"download_{url_hash}_{audio_format_id_short}_{user_id}"
+            
+            keyboard.append([InlineKeyboardButton(audio_button_text, callback_data=audio_callback_data)])
         
-        # Добавляем кнопку отмены
-        url_hash = hashlib.md5(url.encode()).hexdigest()
+        # Добавляем кнопку отмены с коротким хешем
+        url_hash = hashlib.md5(url.encode()).hexdigest()[:10]
         keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data=f"cancel_{url_hash}_{user_id}")])
         
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -963,6 +1007,35 @@ async def download_with_quality(update: Update, context: ContextTypes.DEFAULT_TY
                 'message_id': message_id
             }
         
+        # Проверяем, является ли URL адресом TikTok
+        is_tiktok = 'tiktok.com' in url.lower()
+        
+        # Если это TikTok, используем настройки без указания конкретного формата
+        # или используем специальный формат для TikTok, если указан audio
+        ydl_opts = None
+        if is_tiktok:
+            logger.info(f"Обнаружено видео TikTok: {url}. Используем автоматический выбор формата.")
+            # Для TikTok используем автоматический выбор формата
+            if format_id.lower() == 'audio':
+                # Если запрошено аудио из TikTok
+                ydl_opts = {
+                    'format': 'bestaudio',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                    }]
+                }
+            else:
+                # Для видео TikTok используем лучший доступный формат
+                ydl_opts = {
+                    'format': 'best'
+                }
+        else:
+            # Для других платформ используем выбранный пользователем формат
+            ydl_opts = {
+                'format': format_id
+            }
+            
         # Запускаем загрузку с увеличенным таймаутом
         try:
             # Устанавливаем таймаут в 10 минут (600 секунд)
@@ -972,7 +1045,8 @@ async def download_with_quality(update: Update, context: ContextTypes.DEFAULT_TY
                     format_id=format_id,
                     user_id=user_id,
                     chat_id=chat_id,
-                    message_id=message_id
+                    message_id=message_id,
+                    ydl_opts=ydl_opts  # Передаем дополнительные опции
                 ),
                 timeout=600
             )
@@ -984,12 +1058,46 @@ async def download_with_quality(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
         except Exception as e:
+            error_str = str(e)
             logger.error(f"Ошибка при загрузке видео: {e}")
-            await update.callback_query.edit_message_text(
-                text=f"❌ Ошибка при загрузке видео: {str(e)}",
-                reply_markup=None
-            )
-            return
+            
+            # Обработка ошибки недоступного формата
+            if "Requested format is not available" in error_str:
+                # Пробуем скачать с автоматическим выбором формата
+                try:
+                    logger.info(f"Пробуем скачать с автоматическим выбором формата: {url}")
+                    await update.callback_query.edit_message_text(
+                        text="⚠️ Выбранный формат недоступен. Пробуем скачать в наилучшем доступном качестве...",
+                        reply_markup=None
+                    )
+                    
+                    # Используем 'best' для автоматического выбора лучшего формата
+                    auto_opts = {'format': 'best'}
+                    result = await asyncio.wait_for(
+                        downloader.download_video(
+                            url=url,
+                            format_id='best', # Используем 'best' вместо выбранного формата
+                            user_id=user_id,
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            ydl_opts=auto_opts
+                        ),
+                        timeout=600
+                    )
+                except Exception as retry_error:
+                    logger.error(f"Не удалось скачать даже с автоматическим выбором формата: {retry_error}")
+                    await update.callback_query.edit_message_text(
+                        text=f"❌ Не удалось скачать видео даже с автоматическим выбором формата. Возможно, видео защищено от скачивания.",
+                        reply_markup=None
+                    )
+                    return
+            else:
+                # Для других ошибок показываем сообщение об ошибке
+                await update.callback_query.edit_message_text(
+                    text=f"❌ Ошибка при загрузке видео: {error_str}",
+                    reply_markup=None
+                )
+                return
         
         # Запускаем обновление прогресса
         progress_task = asyncio.create_task(
@@ -1144,13 +1252,34 @@ async def playlist_confirm_callback(update: Update, context: ContextTypes.DEFAUL
     """Обрабатывает подтверждение скачивания плейлиста."""
     query = update.callback_query
     message = query.message
+    
     try:
-         original_message_id = int(query.data.split('_')[-1])
-    except (IndexError, ValueError):
-         logger.error(f"Не удалось извлечь message_id из callback_data: {query.data}")
-         await query.answer("Произошла ошибка.")
-         return
-         
+        # Используем более надежный метод с поиском последнего подчеркивания
+        callback_data = query.data
+        if not callback_data.startswith("pl_confirm_"):
+            logger.error(f"Неверный формат callback_data: {callback_data}")
+            await query.answer("Произошла ошибка.")
+            return
+            
+        # Находим последнее подчеркивание
+        last_underscore_pos = callback_data.rfind('_')
+        if last_underscore_pos == -1:
+            logger.error(f"Неверный формат callback_data (нет последнего '_'): {callback_data}")
+            await query.answer("Произошла ошибка.")
+            return
+            
+        try:
+            original_message_id = int(callback_data[last_underscore_pos+1:])
+            logger.info(f"Извлечен message_id из callback_data: {original_message_id}")
+        except ValueError:
+            logger.error(f"Неверный message_id в callback_data: {callback_data}")
+            await query.answer("Произошла ошибка.")
+            return
+    except (IndexError, ValueError) as e:
+        logger.error(f"Не удалось извлечь message_id из callback_data: {query.data}, ошибка: {e}")
+        await query.answer("Произошла ошибка.")
+        return
+    
     chat_id = message.chat_id
     user_id = query.from_user.id
     
@@ -1288,10 +1417,29 @@ async def playlist_stop_callback(update: Update, context: ContextTypes.DEFAULT_T
     message = query.message
     
     try:
-        # Извлекаем ID сообщения с плейлистом
-        playlist_id = int(query.data.split('_')[-1])
-    except (IndexError, ValueError):
-        logger.error(f"Не удалось извлечь message_id из callback_data: {query.data}")
+        # Используем более надежный метод с поиском последнего подчеркивания
+        callback_data = query.data
+        if not callback_data.startswith("pl_stop_"):
+            logger.error(f"Неверный формат callback_data: {callback_data}")
+            await query.answer("Произошла ошибка.")
+            return
+            
+        # Находим последнее подчеркивание
+        last_underscore_pos = callback_data.rfind('_')
+        if last_underscore_pos == -1:
+            logger.error(f"Неверный формат callback_data (нет последнего '_'): {callback_data}")
+            await query.answer("Произошла ошибка.")
+            return
+            
+        try:
+            playlist_id = int(callback_data[last_underscore_pos+1:])
+            logger.info(f"Извлечен playlist_id из callback_data: {playlist_id}")
+        except ValueError:
+            logger.error(f"Неверный playlist_id в callback_data: {callback_data}")
+            await query.answer("Произошла ошибка.")
+            return
+    except (IndexError, ValueError) as e:
+        logger.error(f"Не удалось извлечь playlist_id из callback_data: {query.data}, ошибка: {e}")
         await query.answer("Произошла ошибка.")
         return
     
@@ -1336,41 +1484,60 @@ async def playlist_cancel_callback(update: Update, context: ContextTypes.DEFAULT
     """Обрабатывает отмену скачивания плейлиста."""
     query = update.callback_query
     message = query.message
+    
     try:
-         original_message_id = int(query.data.split('_')[-1])
-    except (IndexError, ValueError):
-         logger.error(f"Не удалось извлечь message_id из callback_data отмены: {query.data}")
-         await query.answer("Произошла ошибка.")
-         return
+        # Используем более надежный метод с поиском последнего подчеркивания
+        callback_data = query.data
+        if not callback_data.startswith("pl_cancel_"):
+            logger.error(f"Неверный формат callback_data: {callback_data}")
+            await query.answer("Произошла ошибка.")
+            return
+            
+        # Находим последнее подчеркивание
+        last_underscore_pos = callback_data.rfind('_')
+        if last_underscore_pos == -1:
+            logger.error(f"Неверный формат callback_data (нет последнего '_'): {callback_data}")
+            await query.answer("Произошла ошибка.")
+            return
+            
+        try:
+            original_message_id = int(callback_data[last_underscore_pos+1:])
+            logger.info(f"Извлечен message_id из callback_data отмены: {original_message_id}")
+        except ValueError:
+            logger.error(f"Неверный message_id в callback_data отмены: {callback_data}")
+            await query.answer("Произошла ошибка.")
+            return
+    except (IndexError, ValueError) as e:
+        logger.error(f"Не удалось извлечь message_id из callback_data отмены: {query.data}, ошибка: {e}")
+        await query.answer("Произошла ошибка.")
+        return
 
     try:
         await query.answer()
     except BadRequest as e:
-         if "Query is too old" in str(e) or "query id is invalid" in str(e):
-             logger.warning(f"Callback query для отмены плейлиста устарел: {e}")
-             try:
-                 await context.bot.edit_message_text(chat_id=message.chat_id, message_id=original_message_id, text=get_message('error_callback_too_old'))
-             except Exception:
-                 pass
-             return
-         else:
-             logger.error(f"Ошибка BadRequest при ответе на callback отмены плейлиста: {e}")
-             return
+        if "Query is too old" in str(e) or "query id is invalid" in str(e):
+            logger.warning(f"Callback query для отмены плейлиста устарел: {e}")
+            try:
+                await context.bot.edit_message_text(chat_id=message.chat_id, message_id=original_message_id, text=get_message('error_callback_too_old'))
+            except Exception:
+                pass
+            return
+        else:
+            logger.error(f"Ошибка BadRequest при ответе на callback отмены плейлиста: {e}")
+            return
     except Exception as e:
-         logger.warning(f"Не удалось ответить на callback query отмены плейлиста: {e}")
+        logger.warning(f"Не удалось ответить на callback query отмены плейлиста: {e}")
 
     if PLAYLIST_CONTEXT_KEY in context.chat_data and original_message_id in context.chat_data[PLAYLIST_CONTEXT_KEY]:
         context.chat_data[PLAYLIST_CONTEXT_KEY].pop(original_message_id, None)
         if not context.chat_data[PLAYLIST_CONTEXT_KEY]:
-             del context.chat_data[PLAYLIST_CONTEXT_KEY]
+            del context.chat_data[PLAYLIST_CONTEXT_KEY]
         logger.debug(f"Очищен контекст для отмененного плейлиста original_message_id {original_message_id}")
 
     try:
         await query.edit_message_text(get_message('playlist_cancelled'))
     except Exception as e:
         logger.error(f"Не удалось обновить сообщение об отмене плейлиста: {e}")
-
-# --- Конец новой функции --- 
 
 # --- Добавлено: Функция для отправки уведомлений ---
 async def send_notification(context: ContextTypes.DEFAULT_TYPE, user_id: int, notification_type: str, **kwargs):
@@ -1622,8 +1789,15 @@ async def format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Некорректные данные в format_callback: {data}")
         return
 
-    # Извлекаем ID/категорию формата
-    format_id = data.split("_", 1)[1] # format_low, format_medium, format_auto, format_audio и т.д.
+    # Более надежное извлечение ID/категории формата
+    try:
+        # Удаляем префикс "format_"
+        format_id = data[len("format_"):]
+        logger.info(f"Извлечен format_id: {format_id}")
+    except Exception as e:
+        logger.error(f"Ошибка при извлечении format_id из {data}: {e}")
+        await query.edit_message_text(get_message('error_context_lost'))
+        return
 
     # Обработка кнопки отмены
     if format_id == "cancel":
@@ -1670,7 +1844,26 @@ async def large_file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Обрабатывает выбор пользователя при работе с большими файлами (разделение или прямая ссылка)"""
     query = update.callback_query
     data = query.data
-    action, file_id = data.split("_", 1)  # Формат: "split_file_id" или "link_file_id"
+    
+    try:
+        # Более надежный метод извлечения action и file_id
+        if data.startswith("split_"):
+            action = "split"
+            file_id = data[len("split_"):]
+        elif data.startswith("link_"):
+            action = "link"
+            file_id = data[len("link_"):]
+        else:
+            logger.error(f"Неверный формат callback_data: {data}")
+            await query.answer("Произошла ошибка.")
+            return
+            
+        logger.info(f"Извлечены данные: action={action}, file_id={file_id}")
+    except Exception as e:
+        logger.error(f"Ошибка при извлечении данных из callback_data: {data}, ошибка: {e}")
+        await query.answer("Произошла ошибка при обработке запроса.")
+        return
+    
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     
@@ -1863,15 +2056,34 @@ async def cancel_download_callback(update: Update, context: ContextTypes.DEFAULT
         
         # Извлекаем URL и user_id из callback_data
         callback_data = query.data
-        parts = callback_data.replace("cancel_download_", "").split("_")
         
-        if len(parts) < 2:
+        # Для безопасности используем метод с поиском последнего подчеркивания
+        if not callback_data.startswith("cancel_download_"):
             logger.error(f"Неверный формат callback_data: {callback_data}")
             await query.edit_message_text("❌ Ошибка: неверный формат данных")
             return
         
-        url = parts[0]
-        user_id = int(parts[1])
+        # Удаляем префикс "cancel_download_"
+        data_without_prefix = callback_data[len("cancel_download_"):]
+        
+        # Находим последнее подчеркивание
+        last_underscore_pos = data_without_prefix.rfind('_')
+        if last_underscore_pos == -1:
+            logger.error(f"Неверный формат callback_data (нет последнего '_'): {callback_data}")
+            await query.edit_message_text("❌ Ошибка: неверный формат данных")
+            return
+        
+        # Получаем URL и user_id
+        url = data_without_prefix[:last_underscore_pos]
+        
+        try:
+            user_id = int(data_without_prefix[last_underscore_pos+1:])
+        except ValueError:
+            logger.error(f"Неверный user_id в callback_data: {callback_data}")
+            await query.edit_message_text("❌ Ошибка: неверный формат user_id")
+            return
+        
+        logger.info(f"Разобран callback отмены загрузки: url={url}, user_id={user_id}")
         
         # Проверяем, что отменяет загрузку тот же пользователь, который её начал
         if query.from_user.id != user_id:
@@ -1914,15 +2126,32 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Извлекаем URL хеш и user_id из callback_data
         # Формат: "cancel_[url_hash]_[user_id]"
+        # Работаем с конца строки для обеспечения надежности
         parts = data.split('_')
         if len(parts) < 3:
             logger.error(f"Неверный формат callback_data: {data}")
             await query.edit_message_text("❌ Ошибка: неверный формат данных")
             return
-            
-        url_hash = parts[1]
-        user_id = int(parts[2])
         
+        action = parts[0]  # 'cancel'
+        url_hash = parts[1]  # хеш URL
+        
+        # Находим последнюю часть, которая должна быть user_id
+        last_underscore_pos = data.rfind('_')
+        if last_underscore_pos == -1:
+            logger.error(f"Неверный формат callback_data (нет последнего '_'): {data}")
+            await query.edit_message_text("❌ Ошибка: неверный формат данных")
+            return
+            
+        try:
+            user_id = int(data[last_underscore_pos+1:])
+        except ValueError:
+            logger.error(f"Неверный user_id в callback_data: {data}")
+            await query.edit_message_text("❌ Ошибка: неверный формат user_id")
+            return
+        
+        logger.info(f"Разобран callback отмены: action={action}, url_hash={url_hash}, user_id={user_id}")
+            
         # Проверяем, что пользователь, отменяющий загрузку, тот же, что и запрашивал видео
         if update.effective_user.id != user_id:
             logger.warning(f"Пользователь {update.effective_user.id} пытается отменить загрузку пользователя {user_id}")
@@ -1999,15 +2228,41 @@ async def quality_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Извлекаем URL хеш, format_id и user_id из callback_data
         # Формат: "download_[url_hash]_[format_id]_[user_id]"
+        # Формат ID может содержать символы '-', поэтому разбор требует особого подхода
         parts = data.split('_')
-        if len(parts) < 4:
+        if len(parts) < 3:
             logger.error(f"Неверный формат callback_data: {data}")
             await query.edit_message_text("❌ Ошибка: неверный формат данных")
             return
-            
-        url_hash = parts[1]
-        format_id = parts[2]
-        user_id = int(parts[3])
+        
+        action = parts[0]  # 'download'
+        url_hash = parts[1]  # хеш URL
+        
+        # Находим последнюю часть, которая должна быть user_id
+        # Работаем с конца строки, чтобы корректно обработать format_id, содержащий '_'
+        last_underscore_pos = data.rfind('_')
+        if last_underscore_pos == -1:
+            logger.error(f"Неверный формат callback_data (нет последнего '_'): {data}")
+            await query.edit_message_text("❌ Ошибка: неверный формат данных")
+            return
+        
+        try:
+            user_id = int(data[last_underscore_pos+1:])
+        except ValueError:
+            logger.error(f"Неверный user_id в callback_data: {data}")
+            await query.edit_message_text("❌ Ошибка: неверный формат user_id")
+            return
+        
+        # Извлекаем format_id как всё, что между первым '_' после 'download_' и последним '_'
+        first_format_underscore_pos = data.find('_', len(action) + 1)
+        if first_format_underscore_pos == -1:
+            logger.error(f"Неверный формат callback_data (нет первого '_' для format_id): {data}")
+            await query.edit_message_text("❌ Ошибка: неверный формат данных")
+            return
+        
+        format_id = data[first_format_underscore_pos+1:last_underscore_pos]
+        
+        logger.info(f"Разобран callback: action={action}, url_hash={url_hash}, format_id={format_id}, user_id={user_id}")
         
         # Проверяем, что пользователь, выбирающий качество, тот же, что и запрашивал видео
         if update.effective_user.id != user_id:
