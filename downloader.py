@@ -14,6 +14,7 @@ import time
 import aiofiles
 import aiofiles.os
 from urllib.parse import urlparse, urlunparse
+import aiohttp
 
 # Настройка логирования
 logging.basicConfig(
@@ -56,165 +57,108 @@ class VideoDownloader:
         # Добавляем ссылку на объект базы данных
         self.db = db
     
-    async def get_video_info(self, url):
-        """Получение информации о видео без скачивания"""
+    async def get_video_info(self, url: str, ydl_opts: dict = None) -> dict:
+        """Получает информацию о видео со всеми доступными форматами."""
         try:
-            loop = asyncio.get_event_loop()
-            ydl_opts = {
+            # Базовые опции для надежного получения информации о видео
+            base_opts = {
                 'quiet': True,
-                'format': 'best',  # Получаем все доступные форматы
-                'listformats': True,  # Включаем список форматов
                 'no_warnings': True,
-                'extract_flat': False,  # Получаем полную информацию
-                'nocheckcertificate': True,
                 'ignoreerrors': True,
-                'no_color': True,
-                'geo_bypass': True,
-                'geo_bypass_country': 'US',
-                'source_address': '0.0.0.0',  # Используем любой доступный IP
-                'socket_timeout': 15,  # Увеличиваем таймаут
-                'extractor_retries': 5,  # Повторные попытки извлечения
-                'extractor_args': {
-                    'youtube': {
-                        'player_client': ['android'],  # Эмуляция Android-клиента
-                        'skip': ['hls', 'dash']  # Пропускаем некоторые проблемные форматы
-                    }
+                'noplaylist': True,
+                'nocheckcertificate': True,
+                'skip_download': True,
+                # Не указываем конкретный формат, чтобы получить все доступные
+                'format': None
+            }
+            
+            # Объединяем базовые опции с переданными
+            final_opts = {**base_opts, **(ydl_opts or {})}
+            
+            # Выводим опции в лог для отладки
+            logger.info(f"Опции yt-dlp для получения информации о видео: {final_opts}")
+            
+            try:
+                # Попытка 1: Стандартный метод
+                with yt_dlp.YoutubeDL(final_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    
+                    if info and 'formats' in info:
+                        logger.info(f"Получено {len(info['formats'])} форматов для видео {url} (стандартный метод)")
+                        
+                        # Логируем доступные разрешения
+                        heights = set(fmt.get('height', 0) for fmt in info['formats'] if fmt.get('vcodec') != 'none')
+                        logger.info(f"Доступные разрешения: {sorted(list(heights), reverse=True)}")
+                        
+                        # Если видеоформатов нет, попробуем другой метод
+                        if not heights or max(heights, default=0) <= 360:
+                            logger.warning("Не получены форматы высокого разрешения, пробуем альтернативный метод")
+                            raise ValueError("Недостаточно форматов")
+                        
+                        return info
+                
+            except Exception as e:
+                # Логируем ошибку первого метода, но не выходим из функции
+                logger.warning(f"Ошибка при стандартном методе получения форматов: {e}")
+            
+            # Попытка 2: Используем другие параметры
+            try:
+                alt_opts = {
+                    'quiet': True,
+                    'no_warnings': True,
+                    'ignoreerrors': True,
+                    'noplaylist': True,
+                    'nocheckcertificate': True,
+                    'skip_download': True,
+                    'youtube_include_dash_manifest': True,
+                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                 }
-            }
-            
-            def _extract_info():
-                # Пробуем разные методы последовательно
-                errors = []
                 
-                # Метод 1: Стандартный способ
-                try:
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(url, download=False)
-                        if info is not None:
-                            return info
-                        errors.append("Стандартный метод вернул None")
-                except Exception as e:
-                    errors.append(f"Стандартный метод не сработал: {str(e)}")
-                
-                # Метод 2: Пробуем с другим user-agent
-                try:
-                    opts_with_agent = ydl_opts.copy()
-                    opts_with_agent['user_agent'] = 'Mozilla/5.0 (Android 12; Mobile; rv:109.0) Gecko/113.0 Firefox/113.0'
-                    with yt_dlp.YoutubeDL(opts_with_agent) as ydl:
-                        info = ydl.extract_info(url, download=False)
-                        if info is not None:
-                            return info
-                        errors.append("Метод с user-agent вернул None")
-                except Exception as e:
-                    errors.append(f"Метод с user-agent не сработал: {str(e)}")
-                
-                # Метод 3: Если это YouTube, пробуем через инвидиус
-                if 'youtube.com' in url or 'youtu.be' in url:
-                    video_id = None
-                    if 'youtube.com/watch' in url and 'v=' in url:
-                        video_id = url.split('v=')[1].split('&')[0]
-                    elif 'youtu.be/' in url:
-                        video_id = url.split('youtu.be/')[1].split('?')[0]
-                    elif 'youtube.com/shorts/' in url:
-                        video_id = url.split('shorts/')[1].split('?')[0]
+                with yt_dlp.YoutubeDL(alt_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    
+                    if info and 'formats' in info:
+                        logger.info(f"Получено {len(info['formats'])} форматов для видео {url} (альтернативный метод)")
                         
-                    if video_id:
-                        try:
-                            # Пробуем через инвидиус
-                            invidious_url = f"https://invidious.snopyta.org/watch?v={video_id}"
-                            logger.info(f"Пробуем через инвидиус: {invidious_url}")
-                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                                info = ydl.extract_info(invidious_url, download=False)
-                                if info is not None:
-                                    return info
-                                errors.append("Метод через инвидиус вернул None")
-                        except Exception as e:
-                            errors.append(f"Метод через инвидиус не сработал: {str(e)}")
-
-                        # Пробуем другие инвидиус-зеркала
-                        try:
-                            invidious_url2 = f"https://yewtu.be/watch?v={video_id}"
-                            logger.info(f"Пробуем через yewtu.be: {invidious_url2}")
-                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                                info = ydl.extract_info(invidious_url2, download=False)
-                                if info is not None:
-                                    return info
-                                errors.append("Метод через yewtu.be вернул None")
-                        except Exception as e:
-                            errors.append(f"Метод через yewtu.be не сработал: {str(e)}")
-
-                        # Попытка через NewPipe API
-                        try:
-                            piped_url = f"https://piped.kavin.rocks/watch?v={video_id}"
-                            logger.info(f"Пробуем через Piped API: {piped_url}")
-                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                                info = ydl.extract_info(piped_url, download=False)
-                                if info is not None:
-                                    return info
-                                errors.append("Метод через Piped API вернул None")
-                        except Exception as e:
-                            errors.append(f"Метод через Piped API не сработал: {str(e)}")
-                
-                # Выбрасываем ошибку с деталями всех неудачных попыток
-                err_msg = "\n".join(errors)
-                logger.error(f"Все методы получения информации о видео для URL '{url}' не сработали:\n{err_msg}")
-                raise ValueError(f"Не удалось получить информацию о видео после нескольких попыток:\n{err_msg}")
-            
-            info = await loop.run_in_executor(executor, _extract_info)
-            
-            # Проверяем, что info не None
-            if info is None:
-                logger.error("get_video_info: _extract_info вернул None вместо информации о видео")
-                raise ValueError("Не удалось получить информацию о видео после нескольких попыток")
-            
-            # Получаем список доступных форматов
-            formats = []
-            if 'formats' in info:
-                for f in info['formats']:
-                    # Проверяем, что формат содержит видео
-                    if f.get('vcodec') != 'none':
-                        # Оцениваем размер файла, если он не указан
-                        filesize = f.get('filesize')
-                        if not filesize and f.get('tbr'):  # tbr - битрейт в кбит/с
-                            # Оцениваем размер на основе битрейта и длительности
-                            duration = info.get('duration', 0)
-                            if duration > 0:
-                                # Размер = битрейт * длительность / 8 (для байтов)
-                                filesize = int(f['tbr'] * 1000 * duration / 8)
+                        # Логируем доступные разрешения
+                        heights = set(fmt.get('height', 0) for fmt in info['formats'] if fmt.get('vcodec') != 'none')
+                        logger.info(f"Доступные разрешения: {sorted(list(heights), reverse=True)}")
                         
-                        format_info = {
-                            'format_id': f.get('format_id'),
-                            'ext': f.get('ext'),
-                            'resolution': f.get('resolution', 'unknown'),
-                            'height': f.get('height', 0),
-                            'width': f.get('width', 0),
-                            'filesize': filesize,
-                            'fps': f.get('fps'),
-                            'vcodec': f.get('vcodec'),
-                            'acodec': f.get('acodec'),
-                            'quality': f.get('quality', 0),
-                            'tbr': f.get('tbr', 0)  # битрейт в кбит/с
-                        }
-                        formats.append(format_info)
+                        return info
+                
+            except Exception as e:
+                logger.warning(f"Ошибка при альтернативном методе получения форматов: {e}")
+                
+            # Попытка 3: Используем YouTube DL Raw
+            try:
+                raw_opts = {
+                    'quiet': True,
+                    'no_warnings': True,
+                    'youtube_include_dash_manifest': True,
+                    'extractor_args': {'youtube': {'skip': ['dash', 'hls']}},
+                }
+                
+                with yt_dlp.YoutubeDL(raw_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    
+                    if info and 'formats' in info:
+                        logger.info(f"Получено {len(info['formats'])} форматов для видео {url} (метод YouTube Raw)")
+                        
+                        # Логируем доступные разрешения
+                        heights = set(fmt.get('height', 0) for fmt in info['formats'] if fmt.get('vcodec') != 'none')
+                        logger.info(f"Доступные разрешения: {sorted(list(heights), reverse=True)}")
+                        
+                        return info
+                
+            except Exception as e:
+                logger.error(f"Ошибка при YouTube Raw методе получения форматов: {e}")
+                
+            # Если все методы не сработали, возвращаем пустой словарь
+            logger.error(f"Не удалось получить информацию о видео {url} ни одним из методов")
+            return {}
             
-            # Проверяем, есть ли у видео размер файла
-            file_size = info.get('filesize')
-            if not file_size and info.get('duration'):
-                # Примерная оценка: 1 минута HD видео ~ 10MB
-                estimated_size = (info.get('duration') / 60) * 10 * 1024 * 1024
-                file_size = int(estimated_size)
-            
-            return {
-                'title': info.get('title', 'Видео'),
-                'filesize': file_size,
-                'duration': info.get('duration'),
-                'formats': formats,
-                'thumbnail': info.get('thumbnail'),
-                'url': url,
-                'webpage_url': info.get('webpage_url', url)
-            }
         except Exception as e:
-            logger.error(f"Ошибка при получении информации о видео: {e}")
+            logger.error(f"Критическая ошибка при получении информации о видео {url}: {e}")
             raise
     
     def progress_hook(self, d):
@@ -291,116 +235,92 @@ class VideoDownloader:
                         logger.debug(f"Progress hook marked finished for URL '{original_url}' (canonical: '{url}'). Filename: {d.get('filename')}")
                 # --- Конец изменений ---
 
-    async def download_video(self, url, format_id=None, user_id=None, chat_id=None, message_id=None):
-        """Скачивание видео асинхронно"""
+    async def download_video(self, url, format_id, user_id, chat_id=None, message_id=None):
+        """Скачивает видео с указанным форматом."""
         try:
-            # Проверяем наличие директории для скачивания
-            if not os.path.exists(config.DOWNLOAD_DIR):
-                os.makedirs(config.DOWNLOAD_DIR)
+            # Создаем директорию для пользователя, если она не существует
+            user_dir = os.path.join(config.DOWNLOAD_DIR, f"user_{user_id}")
+            os.makedirs(user_dir, exist_ok=True)
             
-            # Создаем временную директорию для этого пользователя
-            user_dir = os.path.join(config.DOWNLOAD_DIR, f"user_{user_id}" if user_id else "anonymous")
-            if not os.path.exists(user_dir):
-                os.makedirs(user_dir)
-            
-            # Проверяем кэш, если включен
-            cached_video = None
-            if config.CACHE_ENABLED:
-                cached_video = self.db.get_cached_video(url, format_id)
-                if cached_video and os.path.exists(cached_video['file_path']):
-                    logger.info(f"Используем кэшированное видео: {cached_video['file_path']}")
-                    if user_id:
-                        self.db.log_download(user_id, url, "success_cache")
-                    return cached_video
-
-            # Если нет в кэше, то скачиваем
-            logger.info(f"Attempting download with format: {format_id}")
-            ydl_opts = self.get_ydl_options(format_id, user_dir, url)
-            
-            # Добавляем обработчик прогресса, если указан message_id
-            if chat_id and message_id:
-                with data_lock:
-                    active_downloads[url]['chat_id'] = chat_id
-                    active_downloads[url]['message_id'] = message_id
-                
-                ydl_opts['progress_hooks'] = [
-                    lambda d: self._progress_hook(d, url)
-                ]
-
-            # Запускаем процесс скачивания
-            loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(None, self._download_with_ydl, ydl_opts, url)
-            
-            if not info or 'filepath' not in info:
-                raise ValueError(f"Не удалось получить информацию о загруженном файле для URL: {url}")
-            
-            file_path = info['filepath']
-            # Проверяем, что файл имеет расширение
-            _, file_ext = os.path.splitext(file_path)
-            if not file_ext:
-                # Если нет расширения, добавляем .mp4 и переименовываем файл
-                new_file_path = file_path + '.mp4'
-                os.rename(file_path, new_file_path)
-                file_path = new_file_path
-                logger.info(f"Добавлено расширение к файлу: {file_path}")
-            
-            # Проверяем существование файла
-            if not os.path.exists(file_path):
-                raise FileNotFoundError(f"Файл не найден после скачивания: {file_path}")
-                
-            # Получаем размер файла
-            file_size = os.path.getsize(file_path)
-            
-            # Добавляем видео в кэш (если включено и успешно скачано)
-            if config.CACHE_ENABLED:
-                # Убедимся, что info не None перед доступом к title
-                cache_title = info.get('title', 'Видео') if info else 'Видео'
-                self.db.add_video_to_cache(url, cache_title, file_path, file_size, format_id)
-            
-            if user_id:
-                self.db.log_download(user_id, url, "success_download")
-            
-            # Возвращаем результат (убедимся, что info есть)
-            final_title = info.get('title', 'Видео') if info else 'Видео'
-            return {
-                'title': final_title,
-                'file_path': file_path,
-                'size': file_size
+            # Базовые опции для yt-dlp
+            base_opts = {
+                'outtmpl': os.path.join(user_dir, '%(title)s-%(id)s.%(ext)s'),
+                'quiet': True,
+                'no_warnings': True,
+                'progress_hooks': [lambda d: self._progress_hook(d, url)],
+                'restrictfilenames': True,
+                'no_color': True
             }
             
+            # Добавляем ID пользователя в опции
+            base_opts['user_id'] = user_id
+            
+            # Опции для формата
+            if format_id == 'audio':
+                format_opts = {'format': 'bestaudio/best'}
+            elif format_id == 'auto':
+                format_opts = {'format': 'best'}
+            else:
+                format_opts = {'format': format_id}
+            
+            # Объединяем опции
+            ydl_opts = {**base_opts, **format_opts}
+            
+            # Логируем опции для отладки
+            logger.debug(f"Опции для yt-dlp: {ydl_opts}")
+            
+            # Скачиваем видео
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Получаем информацию о видео
+                info = ydl.extract_info(url, download=False)
+                
+                # Скачиваем видео
+                ydl.download([url])
+                
+                # Получаем имя файла
+                filename = ydl.prepare_filename(info)
+                
+                # Скачиваем превью, если оно доступно
+                thumbnail_path = None
+                if 'thumbnail' in info:
+                    try:
+                        thumbnail_url = info['thumbnail']
+                        thumbnail_path = os.path.join(user_dir, f"{os.path.basename(filename)}.jpg")
+                        
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(thumbnail_url) as response:
+                                if response.status == 200:
+                                    with open(thumbnail_path, 'wb') as f:
+                                        f.write(await response.read())
+                    except Exception as e:
+                        logger.error(f"Ошибка при скачивании превью: {e}")
+                
+                # Удаляем информацию о загрузке
+                with data_lock:
+                    if url in active_downloads:
+                        del active_downloads[url]
+                
+                return {
+                    'success': True,
+                    'filename': filename,
+                    'thumbnail': thumbnail_path,
+                    'title': info.get('title', ''),
+                    'duration': info.get('duration', 0),
+                    'format': format_id
+                }
+        
         except Exception as e:
-            # Логируем ошибку и пробрасываем дальше
-            logger.error(f"Ошибка при скачивании видео '{url}' (в download_video): {e}")
-            if user_id:
-                self.db.log_download(user_id, url, "error", str(e))
-            raise
-
-        finally:
-             # --- Блок finally остается прежним для очистки --- 
-            # Гарантированно удаляем запись из активных загрузок и маппинга
-            download_info = None
-            final_filename = None
-            canonical_url_to_remove = None
+            logger.error(f"Ошибка при скачивании видео {url}: {e}")
+            
+            # Удаляем информацию о загрузке
             with data_lock:
                 if url in active_downloads:
-                    download_info = active_downloads.pop(url) # Удаляем сразу под блокировкой
-                    final_filename = download_info.get('filename')
-                    canonical_url_to_remove = download_info.get('canonical_url')
-                    
-                    if canonical_url_to_remove and canonical_url_to_remove in canonical_url_map:
-                        del canonical_url_map[canonical_url_to_remove]
-                        logger.debug(f"Removed mapping for {canonical_url_to_remove}. Current map: {canonical_url_map}")
-            # --- Конец изменений --- 
+                    del active_downloads[url]
             
-            # --- Изменено: Асинхронное удаление файла --- 
-            if final_filename and not config.CACHE_ENABLED:
-                 try:
-                     if await aiofiles.os.path.exists(final_filename):
-                         await aiofiles.os.remove(final_filename)
-                         logger.info(f"Удален исходный файл (кэш отключен): {final_filename}")
-                 except OSError as rm_err:
-                     logger.warning(f"Не удалось удалить исходный файл {final_filename}: {rm_err}")
-            # --- Конец изменений ---
+            return {
+                'success': False,
+                'error': str(e)
+            }
 
     def get_download_progress(self, url):
         """Возвращает прогресс загрузки для указанного URL"""
@@ -409,69 +329,21 @@ class VideoDownloader:
         return progress_data
 
     def cancel_download(self, url):
-        """Отменяет загрузку для указанного URL и удаляет временный файл."""
-        # --- Изменено: Используем блокировку и пытаемся убить процесс --- 
-        process_to_terminate = None
-        filename_to_delete = None
-        canonical_url_to_remove = None
-        cancelled_in_dict = False
-
-        with data_lock:
-            if url in active_downloads:
-                logger.info(f"Attempting to cancel download for URL: {url}")
-                download_info = active_downloads.pop(url) # Удаляем из словаря под блокировкой
-                cancelled_in_dict = True
-                filename_to_delete = download_info.get('filename')
-                canonical_url_to_remove = download_info.get('canonical_url')
-                process_to_terminate = download_info.get('process') # Получаем Popen объект
-                
-                if canonical_url_to_remove and canonical_url_to_remove in canonical_url_map:
-                    del canonical_url_map[canonical_url_to_remove]
-                    logger.debug(f"Removed mapping for {canonical_url_to_remove} during cancel. Current map: {canonical_url_map}")
-            else:
-                 logger.warning(f"Attempted to cancel URL not found in active downloads: {url}")
-        
-        # Завершаем процесс и удаляем файл вне блокировки
-        if process_to_terminate:
-             try:
-                 logger.info(f"Terminating process for URL {url} (PID: {process_to_terminate.pid})")
-                 process_to_terminate.terminate() # Отправляем SIGTERM
-                 # Можно добавить ожидание и kill, если terminate не сработает
-                 # try:
-                 #     process_to_terminate.wait(timeout=2) 
-                 # except subprocess.TimeoutExpired:
-                 #     logger.warning(f"Process {process_to_terminate.pid} did not terminate gracefully, killing.")
-                 #     process_to_terminate.kill()
-             except Exception as term_err:
-                 logger.error(f"Error terminating process {process_to_terminate.pid} for URL {url}: {term_err}")
-        else:
-            # Это может случиться, если отмена вызвана до того, как процесс был сохранен
-            if cancelled_in_dict: # Логируем, только если запись была найдена
-                 logger.warning(f"Could not find process object to terminate for cancelled URL {url}")
-
-        # --- Удаление файла (остается как было) --- 
-        if filename_to_delete:
-            # Пытаемся удалить файл, связанный с отмененной загрузкой
-            # Даем небольшую паузу, чтобы файл мог освободиться, если он еще используется
-            time.sleep(0.5) # Используем time.sleep
-            try:
-                # --- Изменено: Асинхронное удаление файла --- 
-                # Используем синхронные операции, т.к. cancel_download не async
-                # TODO: Сделать cancel_download асинхронной для использования aiofiles
-                if os.path.exists(filename_to_delete):
-                    os.remove(filename_to_delete)
-                    logger.info(f"Deleted cancelled download file: {filename_to_delete}")
+        """Отменяет загрузку для указанного URL."""
+        try:
+            with data_lock:
+                if url in active_downloads:
+                    # Помечаем загрузку как отмененную
+                    active_downloads[url]['cancelled'] = True
+                    active_downloads[url]['status'] = 'cancelled'
+                    logger.info(f"Загрузка {url} помечена как отмененная")
+                    return True
                 else:
-                    logger.warning(f"Cancelled download file not found: {filename_to_delete}")
-                # --- Конец изменений (оставили синхронный вариант) --- 
-            except OSError as rm_err:
-                logger.error(f"Failed to delete cancelled download file {filename_to_delete}: {rm_err}")
-        else:
-            if cancelled_in_dict: # Логируем, только если запись была найдена
-                logger.warning(f"Filename not found for cancelled download URL: {url}")
-
-        return cancelled_in_dict # Возвращаем True, если запись была найдена и удалена из словаря
-        # --- Конец изменений --- 
+                    logger.warning(f"URL {url} не найден в активных загрузках")
+                    return False
+        except Exception as e:
+            logger.error(f"Ошибка при отмене загрузки {url}: {e}")
+            return False
 
     async def split_large_video(self, file_path, max_segment_size=35):
         """
@@ -783,8 +655,62 @@ class VideoDownloader:
             raise 
 
     def _progress_hook(self, d, url):
-        """Внутренний метод для обработки прогресса загрузки"""
-        self.progress_hook(d)  # Делегируем внешнему методу
+        """Хук для отслеживания прогресса загрузки."""
+        try:
+            # Получаем информацию о загрузке
+            with data_lock:
+                if url not in active_downloads:
+                    logger.warning(f"URL {url} не найден в активных загрузках")
+                    return
+                
+                download_info = active_downloads[url]
+                
+                # Проверяем, не отменена ли загрузка
+                if download_info.get('cancelled', False):
+                    logger.info(f"Загрузка {url} была отменена")
+                    return
+                
+                # Обновляем данные о прогрессе
+                if d['status'] == 'downloading':
+                    if 'downloaded_bytes' in d:
+                        download_info['downloaded_bytes'] = d['downloaded_bytes']
+                    if 'total_bytes' in d:
+                        download_info['total_bytes'] = d['total_bytes']
+                    elif 'total_bytes_estimate' in d:
+                        download_info['total_bytes'] = d['total_bytes_estimate']
+                    
+                    if 'speed' in d and d['speed']:
+                        download_info['speed'] = d['speed']
+                    if 'eta' in d:
+                        download_info['eta'] = d['eta']
+                    
+                    if download_info['total_bytes'] > 0:
+                        download_info['percent'] = (download_info['downloaded_bytes'] / download_info['total_bytes']) * 100
+                        download_info['percent_rounded'] = round(download_info['percent'])
+                    
+                    download_info['status'] = 'downloading'
+                    download_info['filename'] = d.get('filename')
+                    
+                    # Сохраняем ID пользователя, если он есть в данных
+                    if 'user_id' in d:
+                        download_info['user_id'] = d['user_id']
+                
+                elif d['status'] == 'finished':
+                    download_info['status'] = 'finished'
+                    download_info['percent'] = 100
+                    download_info['percent_rounded'] = 100
+                    
+                    # Сохраняем имя файла
+                    if 'filename' in d:
+                        download_info['filename'] = d['filename']
+                
+                active_downloads[url] = download_info
+                
+                # Логируем прогресс
+                logger.debug(f"Прогресс загрузки {url}: {download_info['percent_rounded']}% ({download_info['downloaded_bytes']}/{download_info['total_bytes']})")
+        
+        except Exception as e:
+            logger.error(f"Ошибка в _progress_hook для {url}: {e}")
 
     def get_ydl_options(self, format_id, output_dir, url):
         """Создает словарь с настройками для yt-dlp на основе запрошенного формата"""
