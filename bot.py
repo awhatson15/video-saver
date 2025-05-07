@@ -11,6 +11,7 @@ import aiofiles
 import aiofiles.os
 from yt_dlp.utils import DownloadError, ExtractorError
 from urllib.parse import urlparse, urlunparse
+import hashlib
 
 # Импортируем наши модули
 import config
@@ -455,11 +456,24 @@ async def _send_video_result(context: ContextTypes.DEFAULT_TYPE, result: dict, c
         if file_size > config.MAX_TELEGRAM_SIZE:
             # --- Изменено: Предлагаем выбор между разделением и прямой ссылкой, если включено ---
             if config.DIRECT_LINK_ENABLED:
-                # Создаем клавиатуру для выбора
+                # Создаем уникальный идентификатор для файла
+                file_id = hashlib.md5(file_path.encode()).hexdigest()[:12]
+                
+                # Сохраняем путь к файлу в контексте
+                if 'large_files' not in context.bot_data:
+                    context.bot_data['large_files'] = {}
+                    
+                context.bot_data['large_files'][file_id] = {
+                    'file_path': file_path,
+                    'title': title,
+                    'size': file_size
+                }
+                
+                # Создаем клавиатуру для выбора с коротким идентификатором
                 keyboard = [
                     [
-                        InlineKeyboardButton(get_message('split_video_button'), callback_data=f"split_{file_path}"),
-                        InlineKeyboardButton(get_message('direct_link_button'), callback_data=f"link_{file_path}")
+                        InlineKeyboardButton(get_message('split_video_button'), callback_data=f"split_{file_id}"),
+                        InlineKeyboardButton(get_message('direct_link_button'), callback_data=f"link_{file_id}")
                     ]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -483,16 +497,6 @@ async def _send_video_result(context: ContextTypes.DEFAULT_TYPE, result: dict, c
                         parse_mode='HTML'
                     )
                     
-                # Сохраняем информацию о файле в контексте для последующей обработки
-                if 'large_files' not in context.chat_data:
-                    context.chat_data['large_files'] = {}
-                    
-                context.chat_data['large_files'][file_path] = {
-                    'title': title,
-                    'size': file_size,
-                    'file_path': file_path
-                }
-                
                 # Файл будет обработан позже после выбора пользователя
                 return
             # --- Конец изменения ---
@@ -1115,7 +1119,7 @@ async def large_file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Обрабатывает выбор пользователя при работе с большими файлами (разделение или прямая ссылка)"""
     query = update.callback_query
     data = query.data
-    action, file_path = data.split("_", 1)  # Формат: "split_/path/to/file" или "link_/path/to/file"
+    action, file_id = data.split("_", 1)  # Формат: "split_file_id" или "link_file_id"
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
     
@@ -1137,16 +1141,18 @@ async def large_file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     # Проверяем, что информация о файле сохранена в контексте
-    if 'large_files' not in context.chat_data or file_path not in context.chat_data['large_files']:
-        logger.warning(f"Не найдены данные большого файла для {file_path}")
+    if 'large_files' not in context.bot_data or file_id not in context.bot_data['large_files']:
+        logger.warning(f"Не найдены данные большого файла для {file_id}")
         try:
             await query.edit_message_text(get_message('error_context_lost'))
         except Exception as e:
             logger.error(f"Не удалось обновить сообщение об утерянном контексте: {e}")
         return
     
-    file_info = context.chat_data['large_files'][file_path]
-    title = file_info.get('title', 'Видео')
+    file_info = context.bot_data['large_files'][file_id]
+    file_path = file_info['file_path']
+    title = file_info['title']
+    file_size = file_info['size']
     
     if action == "split":
         # Разделяем видео на части
@@ -1240,9 +1246,9 @@ async def large_file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
     
     # Удаляем файл из контекста
-    del context.chat_data['large_files'][file_path]
-    if not context.chat_data['large_files']:
-        del context.chat_data['large_files']
+    del context.bot_data['large_files'][file_id]
+    if not context.bot_data['large_files']:
+        del context.bot_data['large_files']
 
 # --- Новая команда для статистики прямых ссылок ---
 async def directlinks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
