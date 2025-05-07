@@ -1208,8 +1208,11 @@ async def large_file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             from link_generator import LinkGenerator
             link_gen = LinkGenerator()
             
-            # Генерируем ссылку
-            link_info = await link_gen.generate_link(file_path, title)
+            # Получаем оригинальное имя файла с расширением
+            original_filename = os.path.basename(file_path)
+            
+            # Генерируем ссылку с правильным именем файла
+            link_info = await link_gen.generate_link(file_path, original_filename)
             
             if not link_info:
                 await context.bot.send_message(

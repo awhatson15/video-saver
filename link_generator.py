@@ -32,9 +32,15 @@ class LinkGenerator:
                 
             # Получаем расширение файла
             _, file_ext = os.path.splitext(filename)
+            if not file_ext:
+                # Если расширение не найдено, добавим .mp4 по умолчанию для видеофайлов
+                file_ext = '.mp4'
+                
             # Создаем безопасное имя с хешем и оригинальным расширением
             safe_filename = f"{file_hash}{file_ext}"
             dest_path = os.path.join(self.storage_path, safe_filename)
+            
+            logger.debug(f"Генерация ссылки: исходный={filename}, расширение={file_ext}, результат={safe_filename}")
             
             # Копируем файл (асинхронно)
             async with aiofiles.open(source_file_path, 'rb') as src_file:
