@@ -4,4 +4,5 @@ python-dotenv==1.0.1
 requests==2.31.0
 aiofiles>=23.1.0
 cryptography>=41.0.0
-pydantic>=2.0.0 
+pydantic>=2.0.0
+transliterate>=1.10.2 

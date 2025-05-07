@@ -1200,7 +1200,7 @@ async def large_file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             
     elif action == "link":
-        # Генерируем прямую ссылку для скачивания
+        # Генерируем прямую ссылку с правильным именем файла
         await query.edit_message_text(get_message('direct_link_generating'))
         
         try:
@@ -1210,8 +1210,12 @@ async def large_file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             
             # Получаем оригинальное имя файла с расширением
             original_filename = os.path.basename(file_path)
-            
-            # Генерируем ссылку с правильным именем файла
+            # Добавляем название видео к имени файла, если оно не является просто номером
+            if title and not title.isdigit() and title != "Видео" and title != original_filename:
+                name_parts = os.path.splitext(original_filename)
+                original_filename = f"{title}{name_parts[1]}" if len(name_parts) > 1 else f"{title}.mp4"
+                
+            # Генерируем ссылку с названием видео в имени файла
             link_info = await link_gen.generate_link(file_path, original_filename)
             
             if not link_info:

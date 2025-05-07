@@ -25,8 +25,7 @@ class LinkGenerator:
                 logger.error(f"Файл не существует: {source_file_path}")
                 return None
                 
-            # Создаем уникальное имя файла, сохраняя расширение
-            file_hash = hashlib.md5(f"{source_file_path}_{time.time()}".encode()).hexdigest()
+            # Если имя файла не предоставлено, используем имя из пути
             if not filename:
                 filename = os.path.basename(source_file_path)
                 
@@ -35,12 +34,36 @@ class LinkGenerator:
             if not file_ext:
                 # Если расширение не найдено, добавим .mp4 по умолчанию для видеофайлов
                 file_ext = '.mp4'
+            
+            # Получаем название файла без расширения для использования в URL
+            name_without_ext = os.path.splitext(filename)[0]
+            
+            # Создаем безопасное URL-friendly название (транслитерация и замена специальных символов)
+            import re
+            from transliterate import translit
+            
+            # Попытка транслитерации с русского на английский
+            try:
+                safe_name = translit(name_without_ext, 'ru', reversed=True)
+            except:
+                # Если не получилось (не русский или ошибка), используем оригинал
+                safe_name = name_without_ext
                 
-            # Создаем безопасное имя с хешем и оригинальным расширением
-            safe_filename = f"{file_hash}{file_ext}"
+            # Заменяем все недопустимые символы на дефисы
+            safe_name = re.sub(r'[^a-zA-Z0-9-]', '-', safe_name)
+            # Заменяем множественные дефисы на один
+            safe_name = re.sub(r'-+', '-', safe_name)
+            # Обрезаем до 50 символов для предотвращения слишком длинных URL
+            safe_name = safe_name[:50].strip('-')
+            
+            # Создаем короткий хеш (8 символов) для уникальности
+            short_hash = hashlib.md5(f"{source_file_path}_{time.time()}".encode()).hexdigest()[:8]
+            
+            # Формируем итоговое имя файла: название-хеш.расширение
+            safe_filename = f"{safe_name}-{short_hash}{file_ext}"
             dest_path = os.path.join(self.storage_path, safe_filename)
             
-            logger.debug(f"Генерация ссылки: исходный={filename}, расширение={file_ext}, результат={safe_filename}")
+            logger.debug(f"Генерация ссылки: исходный={filename}, безопасное имя={safe_name}, результат={safe_filename}")
             
             # Копируем файл (асинхронно)
             async with aiofiles.open(source_file_path, 'rb') as src_file:
