@@ -20,5 +20,6 @@ Thumbs.db
 
 # Project specific files
 downloads/
+downloads/*
 video_cache.db
 *.log 
