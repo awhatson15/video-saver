@@ -133,11 +133,19 @@ async def update_progress_message(context, chat_id, message_id, url):
                     bar = '█' * filled_length + '░' * (bar_length - filled_length)
                     # --- Конец добавления ---
                     
+                    # Создаем клавиатуру с кнопкой отмены
+                    keyboard = [[InlineKeyboardButton(
+                        get_message('cancel_button'), 
+                        callback_data=f"cancel_download_{url[:64]}"  # Ограничиваем длину URL в callback_data
+                    )]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
                         message_id=message_id,
                         # Используем новый ключ локализации со статус-баром
-                        text=get_message('progress_bar', bar=bar, progress=percent)
+                        text=get_message('progress_bar', bar=bar, progress=percent),
+                        reply_markup=reply_markup
                     )
                     last_percent = percent
                 except Exception as e:
@@ -207,7 +215,8 @@ async def handle_single_video_url(update: Update, context: ContextTypes.DEFAULT_
                  logger.info(f"Видеоформаты не найдены для {url}, предлагаем только аудио/авто.")
                  keyboard = [
                      [InlineKeyboardButton(get_message('quality_audio'), callback_data="format_audio")],
-                     [InlineKeyboardButton(get_message('quality_auto_button'), callback_data="format_auto")]
+                     [InlineKeyboardButton(get_message('quality_auto_button'), callback_data="format_auto")],
+                     [InlineKeyboardButton(get_message('cancel_button'), callback_data="format_cancel")]
                  ]
             else:
                 video_formats.sort(key=lambda x: int(x.get('height', 0) or 0), reverse=True)
@@ -249,6 +258,8 @@ async def handle_single_video_url(update: Update, context: ContextTypes.DEFAULT_
             
                 keyboard.append([InlineKeyboardButton(get_message('quality_audio'), callback_data="format_audio")])
                 keyboard.append([InlineKeyboardButton(get_message('quality_auto_button'), callback_data="format_auto")])
+                # Добавляем кнопку отмены
+                keyboard.append([InlineKeyboardButton(get_message('cancel_button'), callback_data="format_cancel")])
 
             reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -752,7 +763,14 @@ async def playlist_confirm_callback(update: Update, context: ContextTypes.DEFAUL
     video_count = len(video_urls)
     
     try:
-        await query.edit_message_text(get_message('playlist_download_starting', count=video_count))
+        # Добавляем кнопку отмены в сообщение о начале загрузки плейлиста
+        keyboard = [[InlineKeyboardButton(get_message('cancel_button'), callback_data=f"pl_stop_{original_message_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            get_message('playlist_download_starting', count=video_count),
+            reply_markup=reply_markup
+        )
     except Exception as e:
          logger.warning(f"Не удалось обновить сообщение о начале загрузки плейлиста: {e}")
 
@@ -763,9 +781,24 @@ async def playlist_confirm_callback(update: Update, context: ContextTypes.DEFAUL
     
     semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
     
+    # Добавляем плейлист в контекст для возможности отмены
+    if 'active_playlists' not in context.bot_data:
+        context.bot_data['active_playlists'] = {}
+    
+    context.bot_data['active_playlists'][original_message_id] = {
+        'is_cancelled': False,
+        'chat_id': chat_id,
+        'tasks': []
+    }
+    
     tasks = []
     started_count = 0
     for video_url in video_urls:
+        # Проверяем, не была ли отменена загрузка
+        if context.bot_data['active_playlists'].get(original_message_id, {}).get('is_cancelled', False):
+            logger.info(f"Загрузка плейлиста {original_message_id} была отменена. Пропуск оставшихся видео.")
+            break
+            
         if not db.check_download_limit(user_id):
             logger.warning(f"(Плейлист) Достигнут лимит для user {user_id}. Пропуск оставшихся {len(video_urls) - started_count} видео.")
             await context.bot.send_message(
@@ -777,24 +810,100 @@ async def playlist_confirm_callback(update: Update, context: ContextTypes.DEFAUL
         db.update_user_stats(user_id, update.effective_user.username)
         started_count += 1
         
-        tasks.append(context.application.create_task(
+        download_task = context.application.create_task(
             _download_playlist_video(context, video_url, user_id, chat_id, user_quality, semaphore)
-        ))
+        )
+        tasks.append(download_task)
+        
+        # Сохраняем задачу для возможности отмены
+        if original_message_id in context.bot_data['active_playlists']:
+            context.bot_data['active_playlists'][original_message_id]['tasks'].append(download_task)
+            
         await asyncio.sleep(0.1)
 
     results = []
     if tasks:
          results = await asyncio.gather(*tasks, return_exceptions=True)
     
+    # Удаляем плейлист из контекста
+    if 'active_playlists' in context.bot_data and original_message_id in context.bot_data['active_playlists']:
+        del context.bot_data['active_playlists'][original_message_id]
+        if not context.bot_data['active_playlists']:
+            del context.bot_data['active_playlists']
+    
     errors_count = sum(1 for res in results if isinstance(res, Exception))
+    
+    # Отправляем сообщение о завершении, только если загрузка не была отменена
+    if not context.bot_data.get('active_playlists', {}).get(original_message_id, {}).get('is_cancelled', False):
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message.message_id,
+                text=get_message('playlist_download_finished', 
+                               total=started_count, 
+                               success=(started_count - errors_count),
+                               errors=errors_count)
+            )
+        except Exception as e:
+            # Если не можем отредактировать, отправляем новое сообщение
+            logger.warning(f"Не удалось обновить сообщение о завершении плейлиста: {e}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=get_message('playlist_download_finished', 
+                               total=started_count, 
+                               success=(started_count - errors_count),
+                               errors=errors_count)
+            )
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=get_message('playlist_download_finished', 
-                         total=started_count, 
-                         success=(started_count - errors_count),
-                         errors=errors_count)
-    )
+# --- Новая функция для отмены загрузки плейлиста ---
+async def playlist_stop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик для отмены загрузки активного плейлиста."""
+    query = update.callback_query
+    message = query.message
+    
+    try:
+        # Извлекаем ID сообщения с плейлистом
+        playlist_id = int(query.data.split('_')[-1])
+    except (IndexError, ValueError):
+        logger.error(f"Не удалось извлечь message_id из callback_data: {query.data}")
+        await query.answer("Произошла ошибка.")
+        return
+    
+    try:
+        await query.answer()
+    except BadRequest as e:
+        if "Query is too old" in str(e) or "query id is invalid" in str(e):
+            logger.warning(f"Callback query для остановки плейлиста устарел: {e}")
+            return
+        else:
+            logger.error(f"Ошибка BadRequest при ответе на callback остановки плейлиста: {e}")
+            return
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при ответе на callback остановки плейлиста: {e}")
+        return
+    
+    if 'active_playlists' not in context.bot_data or playlist_id not in context.bot_data['active_playlists']:
+        logger.warning(f"Не найден активный плейлист {playlist_id} для отмены.")
+        try:
+            await query.edit_message_text(get_message('error_cancel_failed'))
+        except Exception as e:
+            logger.error(f"Не удалось обновить сообщение об ошибке отмены плейлиста: {e}")
+        return
+    
+    # Помечаем плейлист как отмененный
+    context.bot_data['active_playlists'][playlist_id]['is_cancelled'] = True
+    
+    # Отменяем все активные задачи
+    for task in context.bot_data['active_playlists'][playlist_id].get('tasks', []):
+        if not task.done():
+            task.cancel()
+    
+    logger.info(f"Плейлист {playlist_id} отменен пользователем.")
+    
+    try:
+        await query.edit_message_text(get_message('playlist_cancelled'))
+    except Exception as e:
+        logger.error(f"Не удалось обновить сообщение об отмене плейлиста: {e}")
 
 # --- Новая функция-обработчик отмены плейлиста --- 
 async def playlist_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1029,6 +1138,9 @@ def main():
     application.add_handler(CallbackQueryHandler(notification_callback, pattern=r'^notify_'))
     application.add_handler(CallbackQueryHandler(playlist_confirm_callback, pattern=r'^pl_confirm_'))
     application.add_handler(CallbackQueryHandler(playlist_cancel_callback, pattern=r'^pl_cancel_'))
+    application.add_handler(CallbackQueryHandler(playlist_stop_callback, pattern=r'^pl_stop_'))
+    # --- Добавляем обработчик для кнопки отмены загрузки ---
+    application.add_handler(CallbackQueryHandler(cancel_download_callback, pattern=r'^cancel_download_'))
     # --- Регистрируем обработчик колбэков для больших файлов ---
     if config.DIRECT_LINK_ENABLED:
         application.add_handler(CallbackQueryHandler(large_file_callback, pattern=r'^(split|link)_'))
@@ -1082,6 +1194,18 @@ async def format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Извлекаем ID/категорию формата
     format_id = data.split("_", 1)[1] # format_low, format_medium, format_auto, format_audio и т.д.
+
+    # Обработка кнопки отмены
+    if format_id == "cancel":
+        # Удаляем информацию о запросе из контекста
+        if CHAT_CONTEXT_KEY in context.chat_data and message_id in context.chat_data[CHAT_CONTEXT_KEY]:
+            context.chat_data[CHAT_CONTEXT_KEY].pop(message_id, None)
+            if not context.chat_data[CHAT_CONTEXT_KEY]:
+                del context.chat_data[CHAT_CONTEXT_KEY]
+                
+        # Уведомляем пользователя об отмене
+        await query.edit_message_text(get_message('download_cancelled'))
+        return
 
     # Получаем URL из контекста чата для ОДИНОЧНЫХ видео
     url = None
@@ -1292,6 +1416,47 @@ async def cleanup_expired_links(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка при очистке устаревших ссылок: {e}")
 # --- Конец новых функций ---
+
+# --- Новый обработчик для кнопки отмены загрузки --- 
+async def cancel_download_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатие на кнопку отмены загрузки."""
+    query = update.callback_query
+    data = query.data
+    chat_id = update.effective_chat.id
+    
+    try:
+        await query.answer()
+    except BadRequest as e:
+        if "Query is too old" in str(e) or "query id is invalid" in str(e):
+            logger.warning(f"Callback query для отмены загрузки устарел: {e}")
+            return
+        else:
+            logger.error(f"Ошибка BadRequest при ответе на callback отмены загрузки: {e}")
+            return
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при ответе на callback отмены загрузки: {e}")
+        return
+    
+    # Извлекаем URL из callback_data
+    try:
+        url = data.replace("cancel_download_", "", 1)
+        logger.info(f"Запрос на отмену загрузки: {url}")
+        
+        # Пытаемся отменить загрузку
+        cancelled = downloader.cancel_download(url)
+        
+        if cancelled:
+            await query.edit_message_text(get_message('download_cancelled'))
+        else:
+            await query.edit_message_text(get_message('error_cancel_failed'))
+            
+    except Exception as e:
+        logger.error(f"Ошибка при обработке отмены загрузки: {e}")
+        try:
+            await query.edit_message_text(get_message('error_cancel_failed'))
+        except Exception as edit_err:
+            logger.error(f"Не удалось обновить сообщение об ошибке отмены: {edit_err}")
+# --- Конец нового обработчика --- 
 
 if __name__ == '__main__':
     main() 
