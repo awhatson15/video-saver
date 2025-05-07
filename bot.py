@@ -453,9 +453,54 @@ async def _send_video_result(context: ContextTypes.DEFAULT_TYPE, result: dict, c
 
     try:
         if file_size > config.MAX_TELEGRAM_SIZE:
+            # --- Изменено: Предлагаем выбор между разделением и прямой ссылкой, если включено ---
+            if config.DIRECT_LINK_ENABLED:
+                # Создаем клавиатуру для выбора
+                keyboard = [
+                    [
+                        InlineKeyboardButton(get_message('split_video_button'), callback_data=f"split_{file_path}"),
+                        InlineKeyboardButton(get_message('direct_link_button'), callback_data=f"link_{file_path}")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                # Отправляем сообщение с выбором
+                size_mb = round(file_size / (1024 * 1024), 1)
+                if progress_message and message_id:
+                    try:
+                        await progress_message.edit_text(
+                            get_message('large_file_options', title=title, size=size_mb),
+                            reply_markup=reply_markup,
+                            parse_mode='HTML'
+                        )
+                    except Exception as edit_err:
+                        logger.warning(f"Не удалось обновить сообщение {message_id} для выбора метода получения: {edit_err}")
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id, 
+                        text=get_message('large_file_options', title=title, size=size_mb),
+                        reply_markup=reply_markup,
+                        parse_mode='HTML'
+                    )
+                    
+                # Сохраняем информацию о файле в контексте для последующей обработки
+                if 'large_files' not in context.chat_data:
+                    context.chat_data['large_files'] = {}
+                    
+                context.chat_data['large_files'][file_path] = {
+                    'title': title,
+                    'size': file_size,
+                    'file_path': file_path
+                }
+                
+                # Файл будет обработан позже после выбора пользователя
+                return
+            # --- Конец изменения ---
+            
+            # Если прямые ссылки не включены, используем старый метод разделения
             if progress_message and message_id:
                 try:
-                    await progress_message.edit_text(get_message('split_video_started'))
+                    await progress_message.edit_text(get_message('split_video_started_no_progress', title=title))
                 except Exception as edit_err:
                      logger.warning(f"Не удалось обновить сообщение {message_id} о начале разделения: {edit_err}")
             else: 
@@ -970,13 +1015,34 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("notifications", notifications_command))
+    # --- Добавляем новый обработчик команды для статистики прямых ссылок ---
+    if config.DIRECT_LINK_ENABLED:
+        application.add_handler(CommandHandler("directlinks", directlinks_command))
+    # --- Конец добавления ---
+    
     application.add_handler(CallbackQueryHandler(settings_callback, pattern=r'^quality_'))
     application.add_handler(CallbackQueryHandler(format_callback, pattern=r'^format_'))
     application.add_handler(CallbackQueryHandler(notification_callback, pattern=r'^notify_'))
     application.add_handler(CallbackQueryHandler(playlist_confirm_callback, pattern=r'^pl_confirm_'))
     application.add_handler(CallbackQueryHandler(playlist_cancel_callback, pattern=r'^pl_cancel_'))
+    # --- Регистрируем обработчик колбэков для больших файлов ---
+    if config.DIRECT_LINK_ENABLED:
+        application.add_handler(CallbackQueryHandler(large_file_callback, pattern=r'^(split|link)_'))
+    # --- Конец добавления ---
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    
+    # --- Добавляем планировщик задач для очистки устаревших ссылок ---
+    if config.DIRECT_LINK_ENABLED:
+        # Создаем планировщик для периодической очистки устаревших ссылок
+        job_queue = application.job_queue
+        job_queue.run_repeating(
+            cleanup_expired_links, 
+            interval=config.DIRECT_LINK_CLEANUP_INTERVAL,  # Интервал из конфига
+            first=10  # Первый запуск через 10 секунд после старта бота
+        )
+        logger.info(f"Настроена периодическая очистка устаревших ссылок (интервал: {config.DIRECT_LINK_CLEANUP_INTERVAL} сек)")
+    # --- Конец добавления ---
     
     application.run_polling()
 
@@ -1043,6 +1109,176 @@ async def format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Запускаем скачивание одиночного видео
     await download_with_quality(update, context, url, format_id, message)
 # --- Конец восстановленной функции --- 
+
+# --- Новая функция обработки колбэков для выбора способа получения больших файлов ---
+async def large_file_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор пользователя при работе с большими файлами (разделение или прямая ссылка)"""
+    query = update.callback_query
+    data = query.data
+    action, file_path = data.split("_", 1)  # Формат: "split_/path/to/file" или "link_/path/to/file"
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    try:
+        await query.answer()
+    except BadRequest as e:
+        if "Query is too old" in str(e) or "query id is invalid" in str(e):
+            logger.warning(f"Callback query для большого файла устарел: {e}")
+            try:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=query.message.message_id, text=get_message('error_callback_too_old'))
+            except Exception:
+                pass 
+            return
+        else:
+            logger.error(f"Ошибка BadRequest при ответе на callback: {e}")
+            return
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при ответе на callback: {e}")
+        return
+    
+    # Проверяем, что информация о файле сохранена в контексте
+    if 'large_files' not in context.chat_data or file_path not in context.chat_data['large_files']:
+        logger.warning(f"Не найдены данные большого файла для {file_path}")
+        try:
+            await query.edit_message_text(get_message('error_context_lost'))
+        except Exception as e:
+            logger.error(f"Не удалось обновить сообщение об утерянном контексте: {e}")
+        return
+    
+    file_info = context.chat_data['large_files'][file_path]
+    title = file_info.get('title', 'Видео')
+    
+    if action == "split":
+        # Разделяем видео на части
+        await query.edit_message_text(get_message('split_video_started'))
+        
+        try:
+            video_parts = await downloader.split_large_video(file_path)
+            if not video_parts:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=get_message('download_error')
+                )
+                return
+            
+            total_parts = len(video_parts)
+            for i, part_path in enumerate(video_parts, 1):
+                logger.info(f"Отправка части {i}/{total_parts}: {part_path}")
+                with open(part_path, 'rb') as part_file:
+                    await context.bot.send_video(
+                        chat_id=chat_id,
+                        video=part_file,
+                        caption=get_message('split_video_part', part=i, total=total_parts, title=title),
+                        supports_streaming=True,
+                        read_timeout=120, write_timeout=120, connect_timeout=60, pool_timeout=120
+                    )
+                    
+                # Удаляем отправленную часть
+                try:
+                    if os.path.exists(part_path):
+                        os.remove(part_path)
+                        logger.debug(f"Удалена часть видео после отправки: {part_path}")
+                except OSError as rm_err:
+                    logger.warning(f"Не удалось удалить часть видео {part_path}: {rm_err}")
+            
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=get_message('split_video_completed')
+            )
+            
+        except Exception as e:
+            logger.error(f"Ошибка при разделении файла {file_path}: {e}")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=get_message('download_error')
+            )
+            
+    elif action == "link":
+        # Генерируем прямую ссылку для скачивания
+        await query.edit_message_text(get_message('direct_link_generating'))
+        
+        try:
+            # Импортируем здесь для избежания циклических зависимостей
+            from link_generator import LinkGenerator
+            link_gen = LinkGenerator()
+            
+            # Генерируем ссылку
+            link_info = await link_gen.generate_link(file_path, title)
+            
+            if not link_info:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=get_message('direct_link_error')
+                )
+                return
+            
+            # Форматируем дату истечения для локализации
+            expires_str = link_info['expires'].strftime("%d.%m.%Y %H:%M")
+            
+            # Отправляем сообщение с прямой ссылкой
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=get_message('direct_link_ready', 
+                    title=title,
+                    url=link_info['url'],
+                    size=link_info['size_mb'],
+                    expires=expires_str
+                ),
+                parse_mode='HTML',
+                disable_web_page_preview=False
+            )
+            
+            logger.info(f"Создана прямая ссылка для {title}: {link_info['url']}")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при создании прямой ссылки для {file_path}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=get_message('direct_link_error')
+            )
+    
+    # Удаляем файл из контекста
+    del context.chat_data['large_files'][file_path]
+    if not context.chat_data['large_files']:
+        del context.chat_data['large_files']
+
+# --- Новая команда для статистики прямых ссылок ---
+async def directlinks_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для просмотра статистики прямых ссылок (только для админов)"""
+    # Проверяем, является ли пользователь админом (примерно)
+    user_id = update.effective_user.id
+    is_admin = user_id in [123456789]  # Здесь нужно заменить на реальные ID админов
+    
+    if not is_admin:
+        await update.message.reply_text("У вас нет прав для выполнения этой команды.")
+        return
+    
+    from link_generator import LinkGenerator
+    link_gen = LinkGenerator()
+    stats = await link_gen.get_links_stats()
+    
+    await update.message.reply_text(
+        get_message('direct_link_stats',
+            active=stats['active_links'],
+            size=stats['total_size_mb']
+        )
+    )
+
+# --- Функция для периодической очистки устаревших ссылок ---
+async def cleanup_expired_links(context: ContextTypes.DEFAULT_TYPE):
+    """Периодически очищает устаревшие прямые ссылки"""
+    try:
+        from link_generator import LinkGenerator
+        link_gen = LinkGenerator()
+        count = await link_gen.cleanup_expired_links()
+        
+        if count > 0:
+            logger.info(f"Удалено {count} устаревших файлов прямых ссылок")
+    except Exception as e:
+        logger.error(f"Ошибка при очистке устаревших ссылок: {e}")
+# --- Конец новых функций ---
 
 if __name__ == '__main__':
     main() 

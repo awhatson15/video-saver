@@ -48,5 +48,13 @@ NOTIFICATION_SETTINGS = {
     'system_alert': True,       # Системные уведомления
 }
 
+# --- Добавленные настройки для прямых ссылок ---
+DIRECT_LINK_ENABLED = True  # Включить функцию прямых ссылок
+DIRECT_LINK_DOMAIN = 'dl.rox.su'  # Домен для прямых ссылок
+DIRECT_LINK_EXPIRE_HOURS = 24  # Срок действия ссылки в часах
+DIRECT_LINK_MAX_SIZE_GB = 10  # Максимальный суммарный размер файлов для прямых ссылок в ГБ
+DIRECT_LINK_CLEANUP_INTERVAL = 60 * 60  # Интервал очистки просроченных файлов в секундах (каждый час)
+# --- Конец добавленных настроек ---
+
 # Удаляем словарь MESSAGES
 # MESSAGES = { ... } 
