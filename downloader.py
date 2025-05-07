@@ -53,6 +53,8 @@ class VideoDownloader:
         # Создаем директорию для загрузок, если её нет
         if not os.path.exists(config.DOWNLOAD_DIR):
             os.makedirs(config.DOWNLOAD_DIR)
+        # Добавляем ссылку на объект базы данных
+        self.db = db
     
     async def get_video_info(self, url):
         """Получение информации о видео без скачивания"""
