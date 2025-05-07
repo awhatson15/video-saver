@@ -2,6 +2,7 @@ import os
 import uuid
 import time
 import hashlib
+import json
 from datetime import datetime, timedelta
 import aiofiles
 import config
@@ -84,7 +85,6 @@ class LinkGenerator:
             }
             
             # Сохраняем метаданные
-            import json
             async with aiofiles.open(f"{dest_path}.meta", "w", encoding='utf-8') as meta_file:
                 await meta_file.write(json.dumps(meta_data, ensure_ascii=False))
                 
@@ -122,24 +122,45 @@ class LinkGenerator:
                 
                 # Получаем данные метафайла
                 try:
+                    logger.debug(f"Обработка метафайла: {meta_path}")
                     async with aiofiles.open(meta_path, 'r', encoding='utf-8') as f:
                         content = await f.read()
+                        
+                    try:
                         meta_data = json.loads(content)
+                    except json.JSONDecodeError as json_err:
+                        logger.error(f"Ошибка разбора JSON в метафайле {meta_path}: {json_err}")
+                        continue
                         
                     # Проверяем срок действия
-                    expire_time = datetime.fromisoformat(meta_data.get('expires', '2000-01-01'))
+                    expires_str = meta_data.get('expires')
+                    if not expires_str:
+                        logger.warning(f"Метафайл {meta_path} не содержит даты истечения. Пропускаем.")
+                        continue
+                    
+                    try:
+                        expire_time = datetime.fromisoformat(expires_str)
+                    except ValueError as val_err:
+                        logger.error(f"Некорректный формат даты истечения в {meta_path}: {val_err}")
+                        continue
                     
                     if now > expire_time:
                         # Удаляем метафайл и соответствующий файл
                         file_path = meta_path[:-5]  # убираем .meta
                         
                         if os.path.exists(file_path):
-                            os.remove(file_path)
-                            logger.debug(f"Удален просроченный файл: {file_path}")
+                            try:
+                                os.remove(file_path)
+                                logger.debug(f"Удален просроченный файл: {file_path}")
+                            except OSError as os_err:
+                                logger.error(f"Ошибка удаления файла {file_path}: {os_err}")
                             
-                        os.remove(meta_path)
-                        logger.debug(f"Удален метафайл: {meta_path}")
-                        count_removed += 1
+                        try:
+                            os.remove(meta_path)
+                            logger.debug(f"Удален метафайл: {meta_path}")
+                            count_removed += 1
+                        except OSError as os_err:
+                            logger.error(f"Ошибка удаления метафайла {meta_path}: {os_err}")
                         
                 except Exception as e:
                     logger.error(f"Ошибка при обработке метафайла {meta_path}: {e}")
@@ -151,6 +172,8 @@ class LinkGenerator:
             
         except Exception as e:
             logger.error(f"Ошибка при очистке просроченных ссылок: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return 0
             
     async def get_links_stats(self):
@@ -178,13 +201,25 @@ class LinkGenerator:
                 try:
                     async with aiofiles.open(meta_path, 'r', encoding='utf-8') as f:
                         content = await f.read()
+                        
+                    try:
                         meta_data = json.loads(content)
+                    except json.JSONDecodeError:
+                        logger.warning(f"Пропущен некорректный JSON в {meta_path}")
+                        continue
                     
-                    expire_time = datetime.fromisoformat(meta_data.get('expires', '2000-01-01'))
-                    if now < expire_time:
-                        active_links += 1
-                except:
-                    pass
+                    expires_str = meta_data.get('expires')
+                    if not expires_str:
+                        continue
+                        
+                    try:
+                        expire_time = datetime.fromisoformat(expires_str)
+                        if now < expire_time:
+                            active_links += 1
+                    except ValueError:
+                        logger.warning(f"Некорректный формат даты в {meta_path}")
+                except Exception as e:
+                    logger.warning(f"Ошибка при чтении метафайла {meta_path}: {e}")
             
             return {
                 "active_links": active_links,
@@ -193,6 +228,8 @@ class LinkGenerator:
             }
         except Exception as e:
             logger.error(f"Ошибка при получении статистики ссылок: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return {
                 "active_links": 0,
                 "total_size_mb": 0,
