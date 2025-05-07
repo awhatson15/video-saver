@@ -12,6 +12,7 @@ import aiofiles.os
 from yt_dlp.utils import DownloadError, ExtractorError
 from urllib.parse import urlparse, urlunparse
 import hashlib
+import yt_dlp
 
 # Импортируем наши модули
 import config
@@ -209,8 +210,17 @@ async def handle_single_video_url(update: Update, context: ContextTypes.DEFAULT_
         video_info = await downloader.get_video_info(url)
         formats = video_info.get('formats', [])
         
+        # Добавляем логирование для отладки форматов
+        logger.info(f"Получено {len(formats)} форматов для URL: {url}")
         if formats:
+            heights = [f.get('height') for f in formats if f.get('vcodec') != 'none' and f.get('height', 0) > 0]
+            logger.info(f"Доступные разрешения: {sorted(set(h for h in heights if h))}")
+        
+        if formats:
+            # Фильтруем видеоформаты (только те, у которых есть видео и высота > 0)
             video_formats = [f for f in formats if f.get('vcodec') != 'none' and f.get('height', 0) > 0]
+            logger.info(f"Найдено {len(video_formats)} видеоформатов с указанной высотой")
+            
             if not video_formats:
                  logger.info(f"Видеоформаты не найдены для {url}, предлагаем только аудио/авто.")
                  keyboard = [
@@ -219,23 +229,32 @@ async def handle_single_video_url(update: Update, context: ContextTypes.DEFAULT_
                      [InlineKeyboardButton(get_message('cancel_button'), callback_data="format_cancel")]
                  ]
             else:
+                # Сортируем форматы по высоте (от большего к меньшему)
                 video_formats.sort(key=lambda x: int(x.get('height', 0) or 0), reverse=True)
+                
+                # Группируем форматы по высоте, чтобы избежать дубликатов
                 grouped_formats = {}
                 for f in video_formats:
                     height = f.get('height')
                     if height and height not in grouped_formats:
                          grouped_formats[height] = f
                 
+                logger.info(f"Сгруппированные форматы по высоте: {list(grouped_formats.keys())}")
+                
                 keyboard = []
                 format_list_texts = []
+                # Перебираем высоты в порядке убывания
                 for height, f in sorted(grouped_formats.items(), reverse=True):
                     format_id = f.get('format_id')
                     if not format_id:
                         continue
                     
+                    # Определяем категорию качества для callback_data
                     quality_category = 'high'
                     if height <= 480:
                         quality_category = 'medium'
+                    if height <= 360:
+                        quality_category = 'low'
                         
                     size_mb = "?"
                     if f.get('filesize'):
@@ -249,12 +268,17 @@ async def handle_single_video_url(update: Update, context: ContextTypes.DEFAULT_
                             except TypeError:
                                 logger.warning(f"Ошибка при расчете размера для формата {format_id}")
                     
+                    # Создаем текст кнопки
                     format_button_text = get_message('quality_format',
                         resolution=f"{height}p", size=size_mb, fps=f.get('fps', '?'))
                     format_list_texts.append(f"- {format_button_text}")
                     
-                    button_callback_data = f"format_{quality_category}"
+                    # Используем format_id вместо категории для более точного выбора
+                    # button_callback_data = f"format_{quality_category}"
+                    button_callback_data = f"format_{format_id}"
                     keyboard.append([InlineKeyboardButton(format_button_text, callback_data=button_callback_data)])
+                    
+                    logger.info(f"Добавлена кнопка для формата: {height}p, callback_data: {button_callback_data}")
             
                 keyboard.append([InlineKeyboardButton(get_message('quality_audio'), callback_data="format_audio")])
                 keyboard.append([InlineKeyboardButton(get_message('quality_auto_button'), callback_data="format_auto")])
@@ -369,71 +393,249 @@ async def handle_playlist_url(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # --- Конец новой функции --- 
 
-async def _initialize_download(context: ContextTypes.DEFAULT_TYPE, url: str, format_id: str, user_id: int, chat_id: int, message_id: int | None):
-    """Инициализирует загрузку: получает инфо, определяет качество, обновляет сообщение (если message_id есть), инициализирует словари."""
+async def _initialize_download(context, url, chat_id, message_id, user_id, ydl_opts=None):
+    """Инициализирует процесс загрузки видео."""
+    bot = context.bot
     start_time = time.time()
-    actual_format_id = format_id
-    quality_name = format_id
-    canonical_url = url 
-    progress_message = None
-
+    
     try:
-        video_info = await downloader.get_video_info(url)
-        canonical_url = video_info.get('webpage_url', url)
-    except Exception as info_err:
-        logger.warning(f"Не удалось получить video_info для '{url}' в _initialize_download: {info_err}. Используем исходный URL как канонический.")
-
-    if format_id == "auto":
-        quality_label = await downloader.get_optimal_quality(url, user_id)
-        quality_name = {
-            "low": get_message('quality_low'),
-            "medium": get_message('quality_medium'),
-            "high": get_message('quality_high'),
-        }.get(quality_label, quality_label)
-        actual_format_id = quality_label
-    elif format_id in ["low", "medium", "high", "audio"]:
-        quality_name = {
-            "low": get_message('quality_low'),
-            "medium": get_message('quality_medium'),
-            "high": get_message('quality_high'),
-            "audio": get_message('quality_audio')
-        }.get(format_id, format_id)
-    elif format_id.isdigit():
-        quality_name = get_message('quality_numeric_format', format_id=format_id)
-
-    if message_id:
-        text_to_set = get_message('quality_selected', quality=quality_name)
-        try:
-            progress_message = await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text_to_set,
-                reply_markup=None
-            )
-            logger.debug(f"Обновлено сообщение {message_id} с качеством ('{quality_name}').")
-        except Exception as edit_err:
-            logger.error(f"Не удалось обновить сообщение {message_id} с выбранным качеством в _initialize_download: {edit_err}")
-            progress_message = None
-
-    with data_lock:
-        # --- Изменено: Используем нормализованный канонический URL как ключ карты ---
-        normalized_canonical = normalize_url(canonical_url)
-        if normalized_canonical: # Только если нормализация успешна
-            active_downloads[url] = {
-                'percent': 0, 'percent_rounded': 0, 'downloaded_bytes': 0,
-                'speed': 0, 'eta': 0, 'filename': None,
-                'chat_id': chat_id if message_id else None,
-                'message_id': message_id,
-                'canonical_url': canonical_url, # Сохраняем оригинальный канонический для возможной очистки
-                'process': None
-            }
-            canonical_url_map[normalized_canonical] = url # Карта: Нормализованный канонический -> Оригинальный
-            logger.debug(f"Initialized active_downloads for {url}. Map: {normalized_canonical} -> {url}")
-        else:
-             logger.error(f"Не удалось нормализовать канонический URL '{canonical_url}', инициализация для '{url}' пропущена.")
-        # --- Конец изменений ---
+        # Создаем или обновляем сообщение о загрузке
+        progress_text = get_message('download_started')
         
-    return actual_format_id, canonical_url, start_time, progress_message
+        if message_id:
+            try:
+                progress_message = await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=progress_text
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось обновить сообщение {message_id}: {e}")
+                progress_message = await bot.send_message(chat_id=chat_id, text=progress_text)
+                message_id = progress_message.message_id
+        else:
+            progress_message = await bot.send_message(chat_id=chat_id, text=progress_text)
+            message_id = progress_message.message_id
+        
+        # Запускаем процесс скачивания
+        logger.info(f"Начало загрузки для URL: {url} с options: {ydl_opts}")
+        
+        # Инициализируем прогресс-бар и запускаем его обновление
+        progress_data = {
+            'url': url,
+            'filename': None,
+            'status': 'downloading',
+            'downloaded_bytes': 0,
+            'total_bytes': 0,
+            'start_time': start_time,
+            'message_id': message_id,
+            'chat_id': chat_id,
+            'user_id': user_id,
+            'speed': 0,
+            'eta': None,
+            'percent': 0,
+            'last_update': 0
+        }
+        
+        # Сохраняем информацию о прогрессе в контексте
+        if not hasattr(context.bot_data, 'progress_data'):
+            context.bot_data['progress_data'] = {}
+        context.bot_data['progress_data'][url] = progress_data
+        
+        # Запускаем задачу обновления сообщения о прогрессе
+        progress_task = asyncio.create_task(
+            update_progress_message(context, url, start_time)
+        )
+        
+        # Выполняем скачивание
+        result = await asyncio.to_thread(
+            download_video, url, ydl_opts, context, user_id
+        )
+        
+        # Отправляем результат
+        if result:
+            # Останавливаем задачу обновления прогресса
+            if progress_task:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+            
+            # Обновляем сообщение о завершении загрузки
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=get_message('download_complete_preparing')
+                )
+            except Exception as e:
+                logger.warning(f"Не удалось обновить сообщение о завершении загрузки: {e}")
+            
+            # Отправляем видео или аудио
+            file_path = result.get('filepath')
+            thumbnail_path = result.get('thumbnail')
+            duration = result.get('duration', 0)
+            title = result.get('title', 'Видео')
+            
+            if file_path and os.path.exists(file_path):
+                file_size = os.path.getsize(file_path)
+                file_extension = os.path.splitext(file_path)[1].lower()
+                
+                try:
+                    caption = get_message('download_complete',
+                                        title=title,
+                                        size=round(file_size / (1024 * 1024), 1),
+                                        time=round(time.time() - start_time, 1))
+                    
+                    if file_extension in ['.mp4', '.mkv', '.webm', '.avi']:
+                        # Отправляем видео
+                        await bot.send_video(
+                            chat_id=chat_id,
+                            video=open(file_path, 'rb'),
+                            caption=caption,
+                            duration=int(duration) if duration else None,
+                            thumb=open(thumbnail_path, 'rb') if thumbnail_path and os.path.exists(thumbnail_path) else None,
+                            supports_streaming=True
+                        )
+                    elif file_extension in ['.mp3', '.m4a', '.ogg', '.opus']:
+                        # Отправляем аудио
+                        await bot.send_audio(
+                            chat_id=chat_id,
+                            audio=open(file_path, 'rb'),
+                            caption=caption,
+                            duration=int(duration) if duration else None,
+                            thumb=open(thumbnail_path, 'rb') if thumbnail_path and os.path.exists(thumbnail_path) else None,
+                            title=title
+                        )
+                    else:
+                        # Отправляем как документ
+                        await bot.send_document(
+                            chat_id=chat_id,
+                            document=open(file_path, 'rb'),
+                            caption=caption,
+                            thumb=open(thumbnail_path, 'rb') if thumbnail_path and os.path.exists(thumbnail_path) else None
+                        )
+                        
+                    # Удаляем файлы после отправки
+                    try:
+                        os.remove(file_path)
+                        if thumbnail_path and os.path.exists(thumbnail_path):
+                            os.remove(thumbnail_path)
+                    except Exception as e:
+                        logger.warning(f"Не удалось удалить файлы после отправки: {e}")
+                        
+                    # Удаляем сообщение о прогрессе
+                    try:
+                        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                    except Exception as e:
+                        logger.warning(f"Не удалось удалить сообщение о прогрессе: {e}")
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке результата: {e}")
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=get_message('download_complete_but_error', error=str(e))
+                    )
+            else:
+                logger.error(f"Файл не найден: {file_path}")
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=get_message('download_complete_but_error', error="Файл не найден")
+                )
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Ошибка при инициализации загрузки: {e}")
+        if message_id:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=get_message('download_error', url=url, error=str(e))
+                )
+            except Exception:
+                pass
+        raise
+
+def download_video(url, ydl_opts, context, user_id):
+    """Синхронная функция для скачивания видео (запускается в отдельном потоке)."""
+    temp_dir = os.path.join(config.DOWNLOAD_DIR, f"user_{user_id}")
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Базовые опции
+    base_opts = {
+        'outtmpl': os.path.join(temp_dir, '%(title)s-%(id)s.%(ext)s'),
+        'quiet': True,
+        'no_warnings': True,
+        'progress_hooks': [lambda d: progress_hook(d, context, url)],
+        'restrictfilenames': True,
+        'no_color': True
+    }
+    
+    # Объединяем базовые опции с переданными
+    final_opts = {**base_opts, **(ydl_opts or {})}
+    
+    try:
+        with yt_dlp.YoutubeDL(final_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info:
+                result = {
+                    'filepath': ydl.prepare_filename(info),
+                    'title': info.get('title', 'Видео'),
+                    'thumbnail': info.get('thumbnail'),
+                    'duration': info.get('duration'),
+                    'size': info.get('filesize', 0)
+                }
+                
+                # Если расширение не соответствует формату, исправляем путь
+                if info.get('ext') and not result['filepath'].endswith(info['ext']):
+                    new_path = f"{os.path.splitext(result['filepath'])[0]}.{info['ext']}"
+                    if os.path.exists(new_path):
+                        result['filepath'] = new_path
+                
+                return result
+    except Exception as e:
+        logger.error(f"Ошибка при скачивании видео {url}: {e}")
+        raise
+    
+    return None
+
+def progress_hook(d, context, url):
+    """Хук для отслеживания прогресса скачивания."""
+    if not hasattr(context.bot_data, 'progress_data') or url not in context.bot_data['progress_data']:
+        return
+    
+    progress_data = context.bot_data['progress_data'][url]
+    
+    # Обновляем данные о прогрессе
+    if d['status'] == 'downloading':
+        if 'downloaded_bytes' in d:
+            progress_data['downloaded_bytes'] = d['downloaded_bytes']
+        if 'total_bytes' in d:
+            progress_data['total_bytes'] = d['total_bytes']
+        elif 'total_bytes_estimate' in d:
+            progress_data['total_bytes'] = d['total_bytes_estimate']
+        
+        if 'speed' in d and d['speed']:
+            progress_data['speed'] = d['speed']
+        if 'eta' in d:
+            progress_data['eta'] = d['eta']
+        
+        if progress_data['total_bytes'] > 0:
+            progress_data['percent'] = (progress_data['downloaded_bytes'] / progress_data['total_bytes']) * 100
+        
+        progress_data['status'] = 'downloading'
+        progress_data['filename'] = d.get('filename')
+    
+    elif d['status'] == 'finished':
+        progress_data['status'] = 'finished'
+        progress_data['percent'] = 100
+        
+    context.bot_data['progress_data'][url] = progress_data
 
 async def _run_actual_download(context: ContextTypes.DEFAULT_TYPE, url: str, actual_format_id: str, user_id: int, chat_id: int | None, message_id: int | None):
     """Запускает фоновую задачу обновления прогресса (если нужно) и саму загрузку."""
@@ -611,59 +813,68 @@ def _cleanup_download_state(url: str, canonical_url: str | None, progress_task):
                  logger.debug(f"Removed mapping with value '{url}' (key: {found_key_to_remove}) during fallback cleanup.")
 
 # --- Основная функция-оркестратор для одиночного скачивания --- 
-async def download_with_quality(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, format_id: str, progress_message: Update):
-    """Скачивание ОДИНОЧНОГО видео с выбранным качеством (оркестратор)"""
+async def download_with_quality(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str, quality: str, message=None):
+    """Скачать видео с указанным качеством."""
+    chat_id = update.effective_chat.id
+    message_id = None
     user_id = update.effective_user.id
-    chat_id = progress_message.chat_id
-    message_id = progress_message.message_id 
     
-    result = None
-    progress_task = None
-    canonical_url = None
-    start_time = None
-
+    # Определяем, откуда брать сообщение для обновления
+    if message:
+        message_id = message.message_id
+    
     try:
-        db.update_user_stats(user_id, update.effective_user.username)
+        logger.info(f"Запрос на скачивание видео с качеством '{quality}' от пользователя ID:{user_id}")
         
-        actual_format_id, canonical_url, start_time, current_progress_message = await _initialize_download(
-            context, url, format_id, user_id, chat_id, message_id
+        # Проверка количества активных загрузок пользователя
+        if not await user_can_download(user_id, chat_id):
+            logger.warning(f"Превышен лимит загрузок для пользователя {user_id}")
+            if message:
+                await message.edit_text(get_message('download_limit_reached'))
+            return
+            
+        # Подготовка options для youtube-dl в зависимости от выбранного качества
+        ydl_opts = {}
+        
+        if quality == 'audio':
+            # Аудио-формат
+            logger.info(f"Выбрано скачивание только аудио для {url}")
+            ydl_opts = {'format': 'bestaudio'}
+        elif quality == 'auto':
+            # Автоматический выбор лучшего формата в рамках лимитов
+            logger.info(f"Выбрано автоматическое качество для {url}")
+            ydl_opts = {'format': 'best'}
+        else:
+            # Проверяем, является ли quality точным format_id или категорией
+            if quality in ['low', 'medium', 'high']:
+                # Категория качества - используем соответствующую format_filter
+                logger.info(f"Выбрана категория качества '{quality}' для {url}")
+                if quality == 'low':
+                    ydl_opts = {'format': config.FORMAT_FILTER_LOW}
+                elif quality == 'medium':
+                    ydl_opts = {'format': config.FORMAT_FILTER_MEDIUM}
+                elif quality == 'high':
+                    ydl_opts = {'format': config.FORMAT_FILTER_HIGH}
+            else:
+                # Точный format_id - используем его напрямую
+                logger.info(f"Выбран точный format_id '{quality}' для {url}")
+                ydl_opts = {'format': quality}
+        
+        # Инициализируем процесс загрузки
+        download_task = asyncio.create_task(
+            _initialize_download(context, url, chat_id, message_id, user_id, ydl_opts)
         )
-        if current_progress_message: 
-             progress_message = current_progress_message
-
-        result, progress_task = await _run_actual_download(
-            context, url, actual_format_id, user_id, chat_id, message_id
-        )
-
-        if result:
-            download_duration = round(time.time() - start_time, 1)
-            await send_notification(
-                context, user_id, "download_complete",
-                title=result['title'],
-                quality=get_message(f'quality_{actual_format_id}') if actual_format_id in ['low', 'medium', 'high', 'audio'] else actual_format_id,
-                size=round(result['size'] / (1024 * 1024), 1),
-                time=download_duration
-            )
-            await _send_video_result(context, result, chat_id, message_id, progress_message)
-
+        
+        # Добавляем задачу в активные загрузки
+        if chat_id not in context.bot_data.get('active_downloads', {}):
+            context.bot_data.setdefault('active_downloads', {})[chat_id] = {}
+        context.bot_data['active_downloads'][chat_id][url] = download_task
+        
     except Exception as e:
-        logger.exception(f"Ошибка при обработке запроса на скачивание для URL '{url}': {e}")
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id, 
-                message_id=message_id, 
-                text=get_message('download_error')
-            )
-        except Exception as edit_err:
-            logger.error(f"Не удалось отредактировать сообщение {message_id} об ошибке скачивания: {edit_err}")
-        await send_notification(
-            context, user_id, "download_error",
-            title=url, error=str(e)
-        )
-
-    finally:
-        # Передаем оригинальный url и оригинальный canonical_url для очистки
-        _cleanup_download_state(url, canonical_url, progress_task)
+        logger.error(f"Ошибка при запуске скачивания с качеством '{quality}': {e}", exc_info=True)
+        error_message = get_message('download_error', url=url, error=str(e))
+        if message:
+            await message.edit_text(error_message)
 
 # --- Новая функция-воркер для скачивания видео из плейлиста --- 
 async def _download_playlist_video(context: ContextTypes.DEFAULT_TYPE, video_url: str, user_id: int, chat_id: int, quality: str, semaphore: asyncio.Semaphore):
@@ -1225,11 +1436,8 @@ async def format_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
              logger.error(f"Не удалось отредактировать сообщение об утерянном контексте видео: {e}")
         return
 
-    # Обновляем сообщение перед началом скачивания (опционально, т.к. _initialize_download тоже это делает)
-    # try:
-    #     await message.edit_text(get_message('download_started'))
-    # except Exception as e:
-    #     logger.warning(f"Не удалось отредактировать сообщение на 'download_started' в format_callback: {e}")
+    # Логируем информацию о выбранном формате
+    logger.info(f"Выбран формат: {format_id} для URL: {url}")
 
     # Обновляем статистику перед началом загрузки
     db.update_user_stats(update.effective_user.id, update.effective_user.username)
