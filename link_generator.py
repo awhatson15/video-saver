@@ -11,7 +11,8 @@ logger = logging.getLogger(__name__)
 
 class LinkGenerator:
     def __init__(self):
-        self.storage_path = os.path.join(config.DOWNLOAD_DIR, 'shared')
+        # Используем путь из конфига
+        self.storage_path = config.DIRECT_LINK_STORAGE
         # Директория создается при инициализации, если не существует
         if not os.path.exists(self.storage_path):
             os.makedirs(self.storage_path, exist_ok=True)

@@ -54,6 +54,7 @@ DIRECT_LINK_DOMAIN = 'dl.rox.su'  # Домен для прямых ссылок
 DIRECT_LINK_EXPIRE_HOURS = 24  # Срок действия ссылки в часах
 DIRECT_LINK_MAX_SIZE_GB = 10  # Максимальный суммарный размер файлов для прямых ссылок в ГБ
 DIRECT_LINK_CLEANUP_INTERVAL = 60 * 60  # Интервал очистки просроченных файлов в секундах (каждый час)
+DIRECT_LINK_STORAGE = os.getenv('DIRECT_LINK_STORAGE', '/var/www/downloads/shared')  # Путь к директории для хранения файлов
 # --- Конец добавленных настроек ---
 
 # Удаляем словарь MESSAGES
