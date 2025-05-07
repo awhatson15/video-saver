@@ -781,3 +781,114 @@ class VideoDownloader:
         except Exception as e:
             logger.error(f"Неожиданная ошибка при получении информации о плейлисте {playlist_url}: {e}")
             raise 
+
+    def _progress_hook(self, d, url):
+        """Внутренний метод для обработки прогресса загрузки"""
+        self.progress_hook(d)  # Делегируем внешнему методу
+
+    def get_ydl_options(self, format_id, output_dir, url):
+        """Создает словарь с настройками для yt-dlp на основе запрошенного формата"""
+        # Определяем формат для yt-dlp на основе format_id
+        format_specifier = None
+        if format_id and format_id.isdigit():
+            format_specifier = f"{format_id}+bestaudio/bestaudio[ext=m4a]/{format_id}"
+        elif format_id == 'auto':
+            format_specifier = config.DEFAULT_VIDEO_FORMAT
+        else:
+            format_specifier = config.VIDEO_FORMATS.get(format_id, config.DEFAULT_VIDEO_FORMAT)
+        
+        # Выходной шаблон имени файла
+        output_template = os.path.join(output_dir, '%(title)s.%(ext)s')
+        
+        # Создаем словарь с настройками
+        ydl_opts = {
+            'format': format_specifier,
+            'outtmpl': output_template,
+            'quiet': True,
+            'format_sort': ['res', 'ext:mp4:m4a'],
+            'format_preference': ['mp4', 'm4a'],
+            'merge_output_format': 'mp4',
+            'file_access_retries': 10,
+            'nocheckcertificate': True,
+            'ignoreerrors': True,
+            'no_color': True,
+            'geo_bypass': True,
+            'geo_bypass_country': 'US',
+            'source_address': '0.0.0.0',
+            'socket_timeout': 15,
+            'extractor_retries': 5,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android'],
+                    'skip': ['hls', 'dash']
+                }
+            }
+        }
+        
+        # Настройки постобработки
+        if format_id != 'audio':
+            ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
+        else:
+            ydl_opts['postprocessors'] = []
+            ydl_opts['merge_output_format'] = None
+        
+        return ydl_opts
+    
+    def _download_with_ydl(self, ydl_opts, url):
+        """Скачивает видео с использованием yt-dlp и возвращает информацию о нем"""
+        try:
+            logger.info(f"Скачивание видео: {url}, формат: {ydl_opts.get('format')}")
+            
+            # Метод 1: Стандартный способ
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info:
+                    filepath = ydl.prepare_filename(info)
+                    return {'title': info.get('title', 'Видео'), 'filepath': filepath}
+            
+            # Если стандартный метод не сработал, пробуем другой user-agent
+            agent_opts = ydl_opts.copy()
+            agent_opts['user_agent'] = 'Mozilla/5.0 (Android 12; Mobile; rv:109.0) Gecko/113.0 Firefox/113.0'
+            with yt_dlp.YoutubeDL(agent_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info:
+                    filepath = ydl.prepare_filename(info)
+                    return {'title': info.get('title', 'Видео'), 'filepath': filepath}
+            
+            # Если и это не помогло, пробуем через альтернативный фронтенд для YouTube
+            if 'youtube.com' in url or 'youtu.be' in url:
+                video_id = None
+                if 'youtube.com/watch' in url and 'v=' in url:
+                    video_id = url.split('v=')[1].split('&')[0]
+                elif 'youtu.be/' in url:
+                    video_id = url.split('youtu.be/')[1].split('?')[0]
+                elif 'youtube.com/shorts/' in url:
+                    video_id = url.split('shorts/')[1].split('?')[0]
+                
+                if video_id:
+                    for invidious_domain in ["invidious.snopyta.org", "yewtu.be", "piped.kavin.rocks"]:
+                        try:
+                            invidious_url = f"https://{invidious_domain}/watch?v={video_id}"
+                            logger.info(f"Пробуем скачать через {invidious_domain}: {invidious_url}")
+                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                                info = ydl.extract_info(invidious_url, download=True)
+                                if info:
+                                    filepath = ydl.prepare_filename(info)
+                                    return {'title': info.get('title', 'Видео'), 'filepath': filepath}
+                        except Exception as e:
+                            logger.warning(f"Метод через {invidious_domain} не сработал: {e}")
+            
+            # Последняя попытка со стандартным форматом
+            fallback_opts = ydl_opts.copy()
+            fallback_opts['format'] = config.DEFAULT_VIDEO_FORMAT
+            with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                if info:
+                    filepath = ydl.prepare_filename(info)
+                    return {'title': info.get('title', 'Видео'), 'filepath': filepath}
+            
+            raise ValueError(f"Не удалось скачать видео {url} после всех попыток")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при скачивании видео {url}: {e}")
+            raise 
